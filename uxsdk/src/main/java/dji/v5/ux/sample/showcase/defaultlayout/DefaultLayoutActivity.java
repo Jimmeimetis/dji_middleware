@@ -306,7 +306,10 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                         DefaultLayoutActivity.this.getMission();
                     }
                     DefaultLayoutActivity.this.postHeartbeat();
-                } catch (JSONException | IOException e) {
+                    // JSONException only: neither call declares IOException
+                    // now that postVehicleData has its own loop, and catching
+                    // an exception that cannot be thrown does not compile.
+                } catch (JSONException e) {
                     e.printStackTrace();
                 }
             }
