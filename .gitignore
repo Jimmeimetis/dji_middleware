@@ -1,0 +1,28 @@
+# Secrets
+secrets.properties
+
+# Build output
+build/
+.gradle/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Local config
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+
+# OS / logs
+.DS_Store
+Thumbs.db
+*.log
+*.hprof

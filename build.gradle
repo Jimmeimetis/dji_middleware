@@ -1,0 +1,49 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+apply from: rootProject.file('dependencies.gradle')
+
+// Keys and passwords live in secrets.properties (git-ignored), not in source.
+def secrets = new Properties()
+def secretsFile = rootProject.file('secrets.properties')
+if (secretsFile.exists()) {
+    secretsFile.withInputStream { secrets.load(it) }
+} else {
+    logger.warn('secrets.properties not found - copy secrets.properties.example and fill it in')
+}
+ext.secret = { String key -> secrets.getProperty(key, '') }
+
+buildscript {
+    repositories {
+        google()
+        jcenter()
+        mavenCentral()
+        maven { url 'https://maven.fabric.io/public' }
+        maven { url 'https://plugins.gradle.org/m2/' }
+        maven { url 'https://dl.bintray.com/kotlin/kotlin-eap' }
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.4.2'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$KOTLIN_VERSION"
+    }
+}
+
+
+allprojects {
+    repositories {
+        maven {
+            url REPO_MAVEN2
+        }
+        google()
+        jcenter()
+        mavenCentral()
+        maven {
+            url KOTLIN_MAVEN
+        }
+        maven { url JITPACK_MAVEN_URL }
+        repositories {
+            flatDir {
+                dirs new File(rootProject.projectDir.getAbsolutePath() + '/libs')
+            }
+        }
+    }
+}

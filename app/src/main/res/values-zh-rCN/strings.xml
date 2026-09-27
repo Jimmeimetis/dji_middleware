@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="product_name">产品名称: %1$s</string>
+    <string name="product_uuid">UUID: %1$s</string>
+    <string name="registration_status">注册状态：%1$s</string>
+    <string name="unregistered">未注册</string>
+    <string name="registered">已注册</string>
+</resources>
