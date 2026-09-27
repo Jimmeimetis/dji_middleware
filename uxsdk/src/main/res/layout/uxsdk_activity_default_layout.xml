@@ -253,6 +253,43 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintBottom_toTopOf="@id/enable_waypoint" />
 
+        <!--
+            Mission and segment controls, stacked above the waypoint buttons.
+            Start and Stop are separate rather than one toggle: they are not
+            symmetric actions - Stop ends the flight record and is what the
+            report is cut from - and a single button that has silently changed
+            meaning is the wrong thing to hand a pilot wearing gloves.
+        -->
+        <Button
+            android:id="@+id/mission_start"
+            android:layout_width="80dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="8dp"
+            android:layout_marginBottom="1dp"
+            android:text="@string/uxsdk_mission_start"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintBottom_toTopOf="@id/disable_waypoint" />
+
+        <Button
+            android:id="@+id/mission_segment"
+            android:layout_width="80dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="8dp"
+            android:layout_marginBottom="1dp"
+            android:text="@string/uxsdk_segment_start"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintBottom_toTopOf="@id/mission_start" />
+
+        <Button
+            android:id="@+id/mission_stop"
+            android:layout_width="80dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="8dp"
+            android:layout_marginBottom="1dp"
+            android:text="@string/uxsdk_mission_stop"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintBottom_toTopOf="@id/mission_segment" />
+
         <dji.v5.ux.core.widget.hsi.PrimaryFlightDisplayWidget
             android:id="@+id/widget_fpv_flight_display_widget"
             android:layout_width="0dp"

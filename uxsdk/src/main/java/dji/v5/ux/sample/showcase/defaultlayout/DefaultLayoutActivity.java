@@ -46,6 +46,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
 import androidx.annotation.NonNull;
@@ -63,6 +64,7 @@ import dji.sampleV5.aircraft.data.FlightControlState;
 import dji.sampleV5.aircraft.data.GimbalControlState;
 import dji.sampleV5.aircraft.models.VirtualStickVM;
 import dji.sdk.keyvalue.key.FlightControllerKey;
+import dji.sdk.keyvalue.key.CameraKey;
 import dji.sdk.keyvalue.key.GimbalKey;
 import dji.sdk.keyvalue.key.KeyTools;
 import dji.sdk.keyvalue.key.ProductKey;
@@ -189,6 +191,9 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     private boolean lockedyaw = false;
     private Button mDisableWaypoint;
     private Button mEnableWaypoint;
+    private Button mMissionStart;
+    private Button mMissionStop;
+    private Button mMissionSegment;
     public String missionId = "0";
     private int wpcounter = 0;
 
@@ -220,27 +225,92 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     private String rtmpUser = "ikaros";
     private String rtmpPass = BuildConfig.RTMP_PASS;
 
+    // ── Camera pose, for geolocation ──────────────────────────────────────
+    //
+    // 35 mm-equivalent focal length of this airframe's WIDE camera at 1x. The
+    // server's calibration is expressed against it (camera_profiles.json,
+    // dji_mavic_wide, ref_focal_mm 24), and PARM recovers the zoom as
+    // focal_mm / ref_focal_mm. Keep the two in step: changing the profile on
+    // the server without changing this scales every ray wrongly.
+    private double wideFocalMm = 24.0;
+    // Latest gimbal attitude, in the gimbal's own frame. yaw is NOT an azimuth
+    // until corrected by imuCoordinateTran - see listenCameraPose().
+    private volatile Double gimbalYawRaw = null;
+    private volatile Double gimbalPitch = null;
+    private volatile Double gimbalRoll = null;
+    // Radians. The offset between the gimbal's yaw frame and the aircraft's,
+    // which is what turns the raw yaw into a true-north azimuth. The uxsdk's
+    // own HSI does exactly this (HSIWidgetModel: yaw + tran * RAD_TO_DEG).
+    private volatile Double imuCoordinateTran = null;
+    // 1.0 at wide. Multiplies wideFocalMm to give the focal length actually in
+    // use, so zooming mid-flight narrows the modelled field of view.
+    private volatile Double zoomRatio = null;
+    private Disposable gimbalAttitudeDisposable;
+    private Disposable imuTranDisposable;
+    private Disposable zoomRatioDisposable;
+
+    // Is a mission running because the pilot pressed Start? The old build
+    // auto-started whatever get_mission returned, which is why the button had
+    // to be removed from the app: there was no moment the pilot chose.
+    private volatile boolean missionStarted = false;
+    // Is a marked segment open? Mirrors the server, which is authoritative -
+    // this only drives the button's label.
+    private volatile boolean segmentOpen = false;
+
     // Unrelated Flask service, still on warden - left alone.
     private String wardenIP= "warden.autonoma-solutions.eu";
     ILiveStreamManager liveStreamManager;
 
     private ICameraStreamManager streamManager;
     private UdpSender udpSender;
+    // Telemetry at 5 Hz. The gimbal and the zoom are what Ikaros geolocates
+    // through, and they move while the aircraft is still - at 0.5 Hz a pan
+    // across a scene was described by two samples, and every detection between
+    // them was placed through a camera pointing somewhere else. The server
+    // interpolates poses by timestamp, so what it can resolve is bounded by
+    // this interval.
+    //
+    // Fire-and-forget: OkHttp's enqueue() does not block, so a slow response
+    // cannot hold up the next sample.
+    private static final long TELEMETRY_INTERVAL_MS = 200;
+    // Mission polling stays slow. It is a question about a database row, not a
+    // measurement, and at 5 Hz it would be 18,000 pointless requests an hour -
+    // enough to matter to the rate limiter if any of them start failing.
+    private static final long MISSION_POLL_INTERVAL_MS = 2000;
+
     private Runnable runnable = new Runnable() {
         public void run() {
-            Log.w("I am in the Handler to send data to drone", "");
             if (DefaultLayoutActivity.telemok) {
                 try {
                     if (!DefaultLayoutActivity.this.missionId.equals("0")) {
                         DefaultLayoutActivity.this.postVehicleData();
                     }
-                    DefaultLayoutActivity.this.getMission();
+                } catch (JSONException | IOException e) {
+                    e.printStackTrace();
+                }
+            }
+            DefaultLayoutActivity.this.handler.postDelayed(this, TELEMETRY_INTERVAL_MS);
+        }
+    };
+
+    // Split out of the telemetry loop: these two answer "is there a mission"
+    // and "am I alive", neither of which is worth asking five times a second.
+    private Runnable missionPollRunnable = new Runnable() {
+        public void run() {
+            if (DefaultLayoutActivity.telemok) {
+                try {
+                    // Only until the pilot starts it. After that the mission is
+                    // known, and re-reading it would overwrite the loaded
+                    // waypoints from under a flight in progress.
+                    if (!DefaultLayoutActivity.this.missionStarted) {
+                        DefaultLayoutActivity.this.getMission();
+                    }
                     DefaultLayoutActivity.this.postHeartbeat();
                 } catch (JSONException | IOException e) {
                     e.printStackTrace();
                 }
             }
-            DefaultLayoutActivity.this.handler.postDelayed(this, 2000);
+            DefaultLayoutActivity.this.handler.postDelayed(this, MISSION_POLL_INTERVAL_MS);
         }
     };
     Runnable secondRunnable = new Runnable() {
@@ -324,14 +394,19 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         Handler handler2 = new Handler();
         this.handler = handler2;
         handler2.postDelayed(this.runnable, 1000);
+        handler2.postDelayed(this.missionPollRunnable, 1000);
         // postDJITelemetry (port 5100) is disabled — endpoint no longer in use
         // Handler handler3 = new Handler();
         // this.handlerlocalization = handler3;
         // handler3.postDelayed(this.thirdRunnable, 100);
         listenFlightControlState();
         listenGimbalControlState();
+        listenCameraPose();
         this.mEnableWaypoint = findViewById(R.id.enable_waypoint);
         this.mDisableWaypoint =findViewById(R.id.disable_waypoint);
+        this.mMissionStart = findViewById(R.id.mission_start);
+        this.mMissionStop = findViewById(R.id.mission_stop);
+        this.mMissionSegment = findViewById(R.id.mission_segment);
         initClickListener();
         MediaDataCenter.getInstance().getCameraStreamManager().addAvailableCameraUpdatedListener(availableCameraUpdatedListener);
         primaryFpvWidget.setOnFPVStreamSourceListener((devicePosition, lensType) -> cameraSourceProcessor.onNext(new CameraSource(devicePosition, lensType)));
@@ -433,16 +508,36 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         liveStreamManager.setLiveStreamQuality(StreamQuality.FULL_HD);
 // liveStreamManager.setLiveVideoBitrateMode(LiveVideoBitrateMode.AUTO);
 //     liveStreamManager.setLiveVideoBitrate(3000000);
-// Start stream
+        // Configured, NOT started. Publishing begins when the pilot presses
+        // Start, together with the mission going InProgress - so the recording
+        // the report is later cut from begins at the moment the mission did,
+        // rather than whenever the tablet happened to be switched on.
+    }
+
+    /**
+     * Begin publishing to live/&lt;vehicleId&gt;.
+     *
+     * Paired with startMission(): the server starts the detector when the
+     * mission goes InProgress, and it needs something publishing to attach to.
+     */
+    private void startLiveStream() {
+        if (liveStreamManager == null) {
+            showToast("Live stream unavailable");
+            return;
+        }
+        if (liveStreamManager.isStreaming()) {
+            return;
+        }
         liveStreamManager.startStream(new CommonCallbacks.CompletionCallback() {
             @Override
             public void onSuccess() {
-                Log.i("RTSP", "Stream started");
+                Log.i("RTMP", "Stream started");
             }
 
             @Override
             public void onFailure(IDJIError error) {
-                Log.e("RTSP", "Stream failed: " + error.description());
+                Log.e("RTMP", "Stream failed: " + error.description());
+                showToast("Stream failed: " + error.description());
             }
         });
     }
@@ -479,6 +574,9 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         });
         this.mEnableWaypoint.setOnClickListener(v -> wpenablefunc());
         this.mDisableWaypoint.setOnClickListener(v -> wpdisablefunc());
+        this.mMissionStart.setOnClickListener(v -> startMission());
+        this.mMissionStop.setOnClickListener(v -> stopMission());
+        this.mMissionSegment.setOnClickListener(v -> toggleSegment());
     }
 
     private void toggleRightDrawer() {
@@ -552,6 +650,17 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         Disposable disposable = this.flightControlDisposable;
         if (disposable != null && !disposable.isDisposed()) {
             this.flightControlDisposable.dispose();
+        }
+        if (handler2 != null && this.missionPollRunnable != null) {
+            handler2.removeCallbacks(this.missionPollRunnable);
+        }
+        // The camera-pose listeners. Left subscribed they outlive the activity
+        // and keep writing into fields nothing reads.
+        for (Disposable d : new Disposable[]{
+                this.gimbalAttitudeDisposable, this.imuTranDisposable, this.zoomRatioDisposable}) {
+            if (d != null && !d.isDisposed()) {
+                d.dispose();
+            }
         }
         Disposable gimbaldisposable = this.gimbalControlDisposable;
         if (gimbaldisposable != null && !gimbaldisposable.isDisposed()) {
@@ -760,7 +869,13 @@ public class DefaultLayoutActivity extends AppCompatActivity {
 
         OkHttpClient client = new OkHttpClient();
         Request request = new Request.Builder()
-                .url(apiBase+"/api/android_app/vehicle/mission/get_mission?vehicleId="+vehicleId)
+                // attended=1: a human is holding this tablet and will decide
+                // when to fly. Without it the server withholds an unscheduled
+                // mission - that gate exists to stop an unattended poller
+                // launching one, and the pilot's presence is the exception it
+                // stands in for. Withheld means the Start button can never
+                // appear, because the mission it would start is invisible.
+                .url(apiBase+"/api/android_app/vehicle/mission/get_mission?vehicleId="+vehicleId+"&attended=1")
                 .get()
                 .addHeader("accept", "*/*")
                 .addHeader("fbauthtoken", fbdevtoken)
@@ -795,8 +910,12 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                     DefaultLayoutActivity.this.missionId = jsonObject.optString("id", "");
 
                     if (!DefaultLayoutActivity.this.missionId.isEmpty()) {
-                        DefaultLayoutActivity.this.postMissionStatus("InProgress");
-
+                        // Load it; do NOT start it. This used to post
+                        // InProgress the instant a mission appeared, so the
+                        // mission began the moment the tablet noticed it and
+                        // there was no point at which the pilot chose - which
+                        // is why the Start button had to be taken out. Starting
+                        // is now startMission(), on a press.
                         JSONObject operationArea = jsonObject.optJSONObject("operation_area");
                         JSONArray pointsArray = (operationArea != null) ? operationArea.optJSONArray("points") : null;
 
@@ -808,8 +927,17 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                             for (int i = 0; i < pointsArray.length(); i++) {
                                 JSONObject pointObject = pointsArray.getJSONObject(i);
 
-                                double latitude = pointObject.optDouble("latitude", 0.0);
-                                double longitude = pointObject.optDouble("longitude", 0.0);
+                                // "lat"/"lon", NOT "latitude"/"longitude". That is the
+                                // shape the drawing map emits and the shape stored in
+                                // mission.operation_area (see Ikaros lib/validations.ts,
+                                // which says so explicitly). Reading the long names gave
+                                // every vertex the 0.0 default, so a loaded mission was a
+                                // polygon off the coast of Africa. Long names still
+                                // accepted, so an older server keeps working.
+                                double latitude = pointObject.optDouble("lat",
+                                        pointObject.optDouble("latitude", 0.0));
+                                double longitude = pointObject.optDouble("lon",
+                                        pointObject.optDouble("longitude", 0.0));
                                 double altitude = pointObject.optDouble("altitude", 20.0);
                                 String heading = pointObject.optString("heading", "USING_WAYPOINT_HEADING");
                                 String speed = pointObject.optString("speed", "3");
@@ -847,6 +975,10 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         params.put("timestamp", formattedDateTime);
         params.put("missionId", this.missionId);
         params.put(NotificationCompat.CATEGORY_STATUS, status);
+        // Labels the server's event log. Absent, the transition is recorded as
+        // the MAVLink middleware's, because a request arriving on that path is
+        // the more conservative assumption.
+        params.put("source", "android");
         new OkHttpClient().newCall(new Request.Builder().url(apiBase+"/api/android_app/vehicle/mission/mission_status").post(RequestBody.create(MediaType.parse("application/json"), params.toString())).addHeader("Content-Type", "application/json").addHeader("fbauthtoken", fbdevtoken).addHeader("userid", userId).build()).enqueue(new Callback() {
             public void onFailure(Call call, IOException e) {
                 e.printStackTrace();
@@ -879,7 +1011,12 @@ public class DefaultLayoutActivity extends AppCompatActivity {
 //        Log.d("current speed", KMLConstants.SPEED + currentState.getSpeed());
         double heading = currentState.getHead();
         if (heading < 0) heading += 360;
-        VehicleData vehicleData = new VehicleData(vehicleId, formattedDateTime, this.missionId, fbdevtoken, (int) currentState.getBattery(), wpcounter+1, heading, currentState.getSpeed(), new Point(currentState.getLatitude(), currentState.getLongitude(), currentState.getHeight()));
+        VehicleData vehicleData = new VehicleData(vehicleId, formattedDateTime, this.missionId, fbdevtoken,
+                (int) currentState.getBattery(), wpcounter+1, heading, currentState.getSpeed(),
+                new Point(currentState.getLatitude(), currentState.getLongitude(), currentState.getHeight()),
+                // Null until the gimbal and the coordinate transform have both
+                // reported. Gson drops null fields, so the frame still posts.
+                currentGimbal(), currentLens());
         Gson gson = new Gson();
         String vehicleDataJson = gson.toJson(vehicleData);
         // new JSONObject(...), not the raw string. Passing the String made
@@ -969,6 +1106,81 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                 RxUtil.addListener(KeyTools.createKey(FlightControllerKey.KeyHeightAboveSeaLevel), this).observeOn(AndroidSchedulers.mainThread()),
                 RxUtil.addListener(KeyTools.createKey(FlightControllerKey.KeyTakeoffLocationAltitude), this).observeOn(AndroidSchedulers.mainThread()),
                 this::updatestate).subscribe();
+    }
+
+    /**
+     * Keep the camera's pose current, for the telemetry Ikaros geolocates from.
+     *
+     * Three separate keys, because the absolute pointing direction is not one
+     * of them: KeyGimbalAttitude's yaw is in the gimbal's own frame, and only
+     * becomes a true-north azimuth once KeyImuCoordinateTran is added (the
+     * uxsdk's own HSI does the same correction - HSIWidgetModel). Sending the
+     * raw yaw would put every detection at a plausible but wrong bearing,
+     * which is the kind of error that looks like a calibration problem for
+     * weeks.
+     *
+     * Each is optional: a missing value leaves its field null and the frame is
+     * still posted, rather than losing position and battery along with it.
+     */
+    private void listenCameraPose() {
+        this.gimbalAttitudeDisposable = RxUtil.addListener(
+                        KeyTools.createKey(GimbalKey.KeyGimbalAttitude), this)
+                .subscribe(attitude -> {
+                    if (attitude != null) {
+                        this.gimbalYawRaw = attitude.getYaw();
+                        this.gimbalPitch = attitude.getPitch();
+                        this.gimbalRoll = attitude.getRoll();
+                    }
+                }, throwable -> LogUtils.e(TAG, "gimbal attitude listener failed", throwable));
+
+        this.imuTranDisposable = RxUtil.addListener(
+                        KeyTools.createKey(FlightControllerKey.KeyImuCoordinateTran), this)
+                .subscribe(tran -> this.imuCoordinateTran = tran,
+                        throwable -> LogUtils.e(TAG, "imu coordinate tran listener failed", throwable));
+
+        // The zoom lens specifically. KeyTools.createCameraKey is what the
+        // uxsdk's own zoom widget uses (FocalZoomWidgetViewModel); an aircraft
+        // with no zoom lens simply never emits, leaving the ratio null and the
+        // focal length at wide.
+        this.zoomRatioDisposable = RxUtil.addListener(
+                        KeyTools.createCameraKey(CameraKey.KeyCameraZoomRatios,
+                                ComponentIndexType.LEFT_OR_MAIN, CameraLensType.CAMERA_LENS_ZOOM), this)
+                .subscribe(ratio -> this.zoomRatio = ratio,
+                        throwable -> LogUtils.e(TAG, "zoom ratio listener failed", throwable));
+    }
+
+    /** Absolute gimbal pointing for the wire, or null if it is not yet known. */
+    private CameraPose.Gimbal currentGimbal() {
+        Double yawRaw = this.gimbalYawRaw;
+        Double tran = this.imuCoordinateTran;
+        Double pitch = this.gimbalPitch;
+        Double roll = this.gimbalRoll;
+        if (yawRaw == null || pitch == null || roll == null) {
+            return null;
+        }
+        // Without the correction the yaw is not an azimuth. Refuse to guess:
+        // an uncorrected value is worse than none, because the server cannot
+        // tell it is wrong.
+        if (tran == null) {
+            return null;
+        }
+        double yaw = yawRaw + Math.toDegrees(tran);
+        // Normalise to 0..360. The server accepts either convention and stores
+        // what it is given, so send one consistently.
+        yaw = ((yaw % 360.0) + 360.0) % 360.0;
+        return new CameraPose.Gimbal(yaw, pitch, roll);
+    }
+
+    /** Focal length in use, or null when the lens is unknown. */
+    private CameraPose.Lens currentLens() {
+        Double ratio = this.zoomRatio;
+        // No zoom lens, or nothing reported yet: the wide focal length is the
+        // honest answer for a camera that cannot zoom.
+        double effective = (ratio == null || ratio <= 0) ? this.wideFocalMm : this.wideFocalMm * ratio;
+        if (!(effective > 0) || Double.isNaN(effective)) {
+            return null;
+        }
+        return new CameraPose.Lens(effective);
     }
 
     private void listenGimbalControlState() {
@@ -1387,5 +1599,153 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         );
     }
 
-}
 
+    // ── Mission and segment controls ──────────────────────────────────────
+    //
+    // Three presses, in the order a sortie actually happens: Start when the
+    // aircraft is over the area, Segment while something is worth looking at,
+    // Stop on the way home.
+
+    /**
+     * Start the loaded mission and begin publishing.
+     *
+     * The mission has to be loaded already - get_mission?attended=1 puts it
+     * there without starting it, which is the whole point of the attended
+     * read. Streaming starts with the status change rather than before it, so
+     * the detector the server starts has a stream to attach to and the
+     * recording begins where the mission does.
+     */
+    public void startMission() {
+        if (this.missionId == null || this.missionId.isEmpty() || this.missionId.equals("0")) {
+            showToast("No mission for this aircraft");
+            return;
+        }
+        if (this.missionStarted) {
+            showToast("Mission already started");
+            return;
+        }
+        try {
+            postMissionStatus("InProgress");
+            this.missionStarted = true;
+            startLiveStream();
+            showToast("Mission started");
+        } catch (JSONException | IOException e) {
+            Log.e("Mission", "start failed", e);
+            showToast("Could not start the mission");
+        }
+    }
+
+    /**
+     * End the mission and stop publishing.
+     *
+     * Completed, not Aborted: this is the ordinary end of a flight. The server
+     * reaps the detector and closes any segment still open, so a forgotten
+     * Segment press cannot leave a span running to the end of time.
+     *
+     * The status goes first and the stream stops second. The other order would
+     * drop the publisher while the server still believed the mission live,
+     * which reads downstream as a stream that failed rather than a flight that
+     * finished.
+     */
+    public void stopMission() {
+        if (this.missionId == null || this.missionId.isEmpty() || this.missionId.equals("0")) {
+            showToast("No mission to stop");
+            return;
+        }
+        try {
+            postMissionStatus("Completed");
+            this.missionStarted = false;
+            this.segmentOpen = false;
+            stopLiveStream();
+            showToast("Mission completed");
+        } catch (JSONException | IOException e) {
+            Log.e("Mission", "stop failed", e);
+            showToast("Could not complete the mission");
+        }
+    }
+
+    /** Open a marked segment if none is open, close it if one is. */
+    public void toggleSegment() {
+        if (!this.missionStarted) {
+            showToast("Start the mission first");
+            return;
+        }
+        postSegment(this.segmentOpen ? "stop" : "start");
+    }
+
+    /**
+     * Open or close a marked span of this flight.
+     *
+     * Segments are what the evidence report is built from: the server scopes
+     * its analysis to them, so what is marked here is what gets looked at, and
+     * the transit and climb are left out rather than diluting it.
+     *
+     * client_ts is this tablet's clock. The server stamps its own and keeps
+     * both - the difference is reaction time plus streaming latency, and
+     * recording it means that offset can be measured later instead of guessed
+     * at now. The server's clock is the one that counts.
+     *
+     * Idempotent on the server in both directions, so a double press or a
+     * retry over a bad link is harmless.
+     */
+    private void postSegment(final String action) {
+        JSONObject params = new JSONObject();
+        try {
+            params.put("missionId", this.missionId);
+            params.put("vehicle_id", vehicleId);
+            params.put("action", action);
+            // ISO-8601 UTC. The server discards a clock more than an hour out
+            // rather than storing something misleading.
+            SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
+            iso.setTimeZone(TimeZone.getTimeZone("UTC"));
+            params.put("client_ts", iso.format(new Date(System.currentTimeMillis())));
+        } catch (JSONException e) {
+            Log.e("Segment", "could not build request", e);
+            return;
+        }
+
+        Request request = new Request.Builder()
+                .url(apiBase + "/api/android_app/vehicle/mission/segment")
+                .post(RequestBody.create(MediaType.parse("application/json"), params.toString()))
+                .addHeader("Content-Type", "application/json")
+                .addHeader("fbauthtoken", fbdevtoken)
+                .addHeader("userid", userId)
+                .build();
+
+        new OkHttpClient().newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                Log.e("Segment", action + " failed", e);
+                showToast("Segment " + action + " failed");
+            }
+
+            @Override
+            public void onResponse(@NonNull Call call, @NonNull Response response) {
+                // Only believe the flag on a response the server accepted.
+                // Flipping it optimistically would leave the button lying
+                // about what the recording actually has marked.
+                if (response.isSuccessful()) {
+                    DefaultLayoutActivity.this.segmentOpen = "start".equals(action);
+                    showToast("start".equals(action) ? "Segment started" : "Segment ended");
+                    updateSegmentButton();
+                } else {
+                    Log.e("Segment", action + " rejected: " + response.code());
+                    showToast("Segment " + action + " rejected");
+                }
+                response.close();
+            }
+        });
+    }
+
+    /** Label the segment button with what the next press will do. */
+    private void updateSegmentButton() {
+        final boolean open = this.segmentOpen;
+        runOnUiThread(() -> {
+            if (this.mMissionSegment != null) {
+                this.mMissionSegment.setText(open
+                        ? R.string.uxsdk_segment_stop
+                        : R.string.uxsdk_segment_start);
+            }
+        });
+    }
+}

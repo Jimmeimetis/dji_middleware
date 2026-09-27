@@ -15,6 +15,13 @@ public class VehicleData {
     private double heading;
     private double speed;
     private Point point;
+    // Where the camera was pointing, and through what lens. Optional on the
+    // wire: Gson omits nulls, and the server's schema accepts their absence,
+    // so a frame without them still carries position and battery rather than
+    // being rejected whole. Without them Ikaros assumes the camera looks
+    // straight down and geolocates every detection wrongly.
+    private CameraPose.Gimbal gimbal;
+    private CameraPose.Lens camera;
 
     public VehicleData(String vehicleId, String timestamp, String missionId, String fbDevtoken, int battery, int nextPoint, double heading, double speed, Point point) {
         this.vehicleId = vehicleId;
@@ -27,6 +34,23 @@ public class VehicleData {
         this.speed = speed;
         this.point = point;
     }
+
+    /** With camera pose. Either block may be null when unavailable. */
+    public VehicleData(String vehicleId, String timestamp, String missionId, String fbDevtoken,
+                       int battery, int nextPoint, double heading, double speed, Point point,
+                       CameraPose.Gimbal gimbal, CameraPose.Lens camera) {
+        this(vehicleId, timestamp, missionId, fbDevtoken, battery, nextPoint, heading, speed, point);
+        this.gimbal = gimbal;
+        this.camera = camera;
+    }
+
+    public CameraPose.Gimbal getGimbal() { return gimbal; }
+
+    public void setGimbal(CameraPose.Gimbal gimbal) { this.gimbal = gimbal; }
+
+    public CameraPose.Lens getCamera() { return camera; }
+
+    public void setCamera(CameraPose.Lens camera) { this.camera = camera; }
 
     // Getters and Setters
     public String getVehicleId() {

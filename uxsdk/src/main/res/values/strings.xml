@@ -23,6 +23,11 @@
 
 <resources>
     <string name="uxsdk_app_name">DJIUXSDK Beta</string>
+    <!-- Mission and segment controls (DefaultLayoutActivity) -->
+    <string name="uxsdk_mission_start">START</string>
+    <string name="uxsdk_mission_stop">STOP</string>
+    <string name="uxsdk_segment_start">SEG ON</string>
+    <string name="uxsdk_segment_stop">SEG OFF</string>
     <string name="uxsdk_app_yes">Yes</string>
     <string name="uxsdk_app_no">No</string>
     <string name="uxsdk_app_ok">OK</string>
