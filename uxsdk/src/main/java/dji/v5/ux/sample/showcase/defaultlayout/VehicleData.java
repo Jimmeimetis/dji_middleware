@@ -20,6 +20,10 @@ public class VehicleData {
     // so a frame without them still carries position and battery rather than
     // being rejected whole. Without them Ikaros assumes the camera looks
     // straight down and geolocates every detection wrongly.
+    // Height above ground, metres. Separate from point.alt, which is MSL:
+    // the two answer different questions and the server stores both. Nullable
+    // because an aircraft that does not report it must not send a confident 0.
+    private Double agl;
     private CameraPose.Gimbal gimbal;
     private CameraPose.Lens camera;
 
@@ -43,6 +47,10 @@ public class VehicleData {
         this.gimbal = gimbal;
         this.camera = camera;
     }
+
+    public Double getAgl() { return agl; }
+
+    public void setAgl(Double agl) { this.agl = agl; }
 
     public CameraPose.Gimbal getGimbal() { return gimbal; }
 

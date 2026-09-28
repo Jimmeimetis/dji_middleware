@@ -139,6 +139,12 @@ abstract class DJIMainActivity : AppCompatActivity() {
         binding.etRtmpHost.setText(prefs.getString("rtmpHost", DEFAULT_RTMP_HOST))
         binding.etRtmpUser.setText(prefs.getString("rtmpUser", DEFAULT_RTMP_USER))
         binding.etRtmpPass.setText(prefs.getString("rtmpPass", DEFAULT_RTMP_PASS))
+        // Metres added to the AGL the aircraft reports, for testing from a
+        // balcony or a rooftop where the drone is already above the ground it
+        // is looking at. Geolocation intersects the camera ray with the
+        // ground using AGL, so with a true AGL of 0 there is no height to
+        // intersect from and nothing can be positioned.
+        binding.etAglOffset.setText(prefs.getFloat("aglOffsetM", 0f).toString())
 
         binding.btnSave.setOnClickListener {
             prefs.edit()
@@ -149,6 +155,10 @@ abstract class DJIMainActivity : AppCompatActivity() {
                 .putString("rtmpHost", binding.etRtmpHost.text.toString().trim())
                 .putString("rtmpUser", binding.etRtmpUser.text.toString().trim())
                 .putString("rtmpPass", binding.etRtmpPass.text.toString().trim())
+                // Blank or unparseable means no offset, rather than refusing
+                // to save the rest of the form over one bad field.
+                .putFloat("aglOffsetM",
+                    binding.etAglOffset.text.toString().trim().toFloatOrNull() ?: 0f)
                 .apply()
 
             ToastUtils.showToast("Values saved")

@@ -224,6 +224,28 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     private String rtmpHost = "rtmp-dev01.autonoma-solutions.eu";
     private String rtmpUser = "ikaros";
     private String rtmpPass = BuildConfig.RTMP_PASS;
+    // Target bitrate for the RTMP publish, in BITS per second.
+    //
+    // Bits, not kilobits: setLiveVideoBitrate takes a bare int and the SDK's
+    // own examples pass 2000000 for 2 Mbps. Getting this wrong by a factor of
+    // a thousand is the difference between a 3 Mbps stream and a 3 kbps one,
+    // so the unit is in the name.
+    //
+    // 3 Mbps at 1080p is a deliberate trade: the link out of a drone on
+    // mobile data is the bottleneck, and an encoder told to use more than the
+    // uplink can carry does not produce a better picture - it produces
+    // buffering, then dropped frames, then a stalled publish. Detection also
+    // tolerates moderate compression long before a human eye objects.
+    //
+    // Overridable from prefs, so it can be raised on a good link without a
+    // rebuild.
+    private int rtmpBitrateBps = 3_000_000;
+    // Metres added to the AGL the aircraft reports, set on the landing screen.
+    // For testing from a balcony or rooftop, where the aircraft sits above the
+    // ground it is looking at but reports AGL 0 because it has not taken off.
+    // Geolocation intersects the camera ray with the ground plane using AGL,
+    // so an AGL of 0 gives it no height to work from and positions nothing.
+    private float aglOffsetM = 0f;
 
     // ── Camera pose, for geolocation ──────────────────────────────────────
     //
@@ -253,6 +275,11 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     // auto-started whatever get_mission returned, which is why the button had
     // to be removed from the app: there was no moment the pilot chose.
     private volatile boolean missionStarted = false;
+    // What the SERVER says this mission's status is. The app is not the
+    // authority: after a crash or an accidental close the mission may already
+    // be InProgress, and pressing Start must resume it rather than announce a
+    // transition that already happened.
+    private volatile String missionStatus = "";
     // Is a marked segment open? Mirrors the server, which is authoritative -
     // this only drives the button's label.
     private volatile boolean segmentOpen = false;
@@ -297,18 +324,22 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     // and "am I alive", neither of which is worth asking five times a second.
     private Runnable missionPollRunnable = new Runnable() {
         public void run() {
+            // NOT gated on telemok. Asking the server whether a mission exists
+            // is a question about a database row, not a measurement - it needs
+            // no aircraft. Gating it meant the Start button could only ever
+            // appear after the drone was powered, linked and GPS-locked, so a
+            // pilot who opened the app first was told "no mission for this
+            // aircraft" while the mission sat there in perfectly good health.
+            // Only until the pilot starts it: after that the mission is known,
+            // and re-reading would overwrite the loaded waypoints mid-flight.
+            if (!DefaultLayoutActivity.this.missionStarted) {
+                DefaultLayoutActivity.this.getMission();
+            }
+            // The heartbeat DOES need telemetry - it reports the aircraft's
+            // state, and there is nothing to report without one.
             if (DefaultLayoutActivity.telemok) {
                 try {
-                    // Only until the pilot starts it. After that the mission is
-                    // known, and re-reading it would overwrite the loaded
-                    // waypoints from under a flight in progress.
-                    if (!DefaultLayoutActivity.this.missionStarted) {
-                        DefaultLayoutActivity.this.getMission();
-                    }
                     DefaultLayoutActivity.this.postHeartbeat();
-                    // JSONException only: neither call declares IOException
-                    // now that postVehicleData has its own loop, and catching
-                    // an exception that cannot be thrown does not compile.
                 } catch (JSONException e) {
                     e.printStackTrace();
                 }
@@ -373,6 +404,8 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         rtmpHost = prefs.getString("rtmpHost", rtmpHost);
         rtmpUser = prefs.getString("rtmpUser", rtmpUser);
         rtmpPass = prefs.getString("rtmpPass", rtmpPass);
+        rtmpBitrateBps = prefs.getInt("rtmpBitrateBps", rtmpBitrateBps);
+        aglOffsetM = prefs.getFloat("aglOffsetM", aglOffsetM);
         getProductUUIDAndShowToast();
         fpvParentView = findViewById(R.id.fpv_holder);
         mDrawerLayout = findViewById(R.id.root_view);
@@ -508,9 +541,21 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         );
         liveStreamManager.setCameraIndex(ComponentIndexType.find(0));
 // Set stream quality, bitrate mode, and exact bitrate
+        // 1080p. FPS is not settable through this API - it follows the camera's
+        // own output, so 30 fps is a camera setting rather than something the
+        // stream can ask for.
         liveStreamManager.setLiveStreamQuality(StreamQuality.FULL_HD);
-// liveStreamManager.setLiveVideoBitrateMode(LiveVideoBitrateMode.AUTO);
-//     liveStreamManager.setLiveVideoBitrate(3000000);
+        // MANUAL first: in AUTO the manual value is ignored and the encoder
+        // picks its own rate, which is what the previous commented-out pair
+        // would have done even uncommented.
+        liveStreamManager.setLiveVideoBitrateMode(LiveVideoBitrateMode.MANUAL);
+        liveStreamManager.setLiveVideoBitrate(rtmpBitrateBps);
+        // Read back and log what the SDK actually accepted, rather than
+        // assuming it took the value as given.
+        Log.i("RTMP", "bitrate requested=" + rtmpBitrateBps + " bps"
+                + " readback=" + liveStreamManager.getLiveVideoBitrate()
+                + " mode=" + liveStreamManager.getLiveVideoBitrateMode()
+                + " quality=" + liveStreamManager.getLiveStreamQuality());
         // Configured, NOT started. Publishing begins when the pilot presses
         // Start, together with the mission going InProgress - so the recording
         // the report is later cut from begins at the moment the mission did,
@@ -911,6 +956,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                 try {
                     JSONObject jsonObject = new JSONObject(res);
                     DefaultLayoutActivity.this.missionId = jsonObject.optString("id", "");
+                    DefaultLayoutActivity.this.missionStatus = jsonObject.optString("status", "");
 
                     if (!DefaultLayoutActivity.this.missionId.isEmpty()) {
                         // Load it; do NOT start it. This used to post
@@ -973,7 +1019,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     /* access modifiers changed from: private */
     public void postMissionStatus(String status) throws JSONException, IOException {
         JSONObject params = new JSONObject();
-        String formattedDateTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date(System.currentTimeMillis()));
+        String formattedDateTime = utcTimestamp(System.currentTimeMillis());
         params.put("vehicle_id", vehicleId);
         params.put("timestamp", formattedDateTime);
         params.put("missionId", this.missionId);
@@ -1002,8 +1048,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
 
         long timestamp = System.currentTimeMillis();
 
-        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-        String formattedDateTime = sdf.format(new Date(timestamp));
+        String formattedDateTime = utcTimestamp(timestamp);
 
         FlightControlState currentState = this.flightControlState.getValue();
 //        Log.d("current lat", "lati" + currentState.getLatitude());
@@ -1014,12 +1059,27 @@ public class DefaultLayoutActivity extends AppCompatActivity {
 //        Log.d("current speed", KMLConstants.SPEED + currentState.getSpeed());
         double heading = currentState.getHead();
         if (heading < 0) heading += 360;
+        // AGL is the only altitude this airframe reports. KeyHeightAboveSeaLevel
+        // returns nothing on it, so no MSL is sent and none is derived:
+        // inventing one from the takeoff elevation would put a number in the
+        // record that nothing measured.
+        //
+        // point.alt carries the same AGL value, because the server's schema
+        // requires an altitude and this is the one that exists. What
+        // geolocation actually uses is the separate agl field
+        // (telemetry_pose.py -> alt_agl_m), which is the height the camera ray
+        // is intersected with the ground from.
+        double aglM = currentState.getHeight() + aglOffsetM;
+        if (aglOffsetM != 0f) {
+            Log.d("Telemetry", "AGL offset " + aglOffsetM + " m applied; agl=" + aglM);
+        }
         VehicleData vehicleData = new VehicleData(vehicleId, formattedDateTime, this.missionId, fbdevtoken,
                 (int) currentState.getBattery(), wpcounter+1, heading, currentState.getSpeed(),
-                new Point(currentState.getLatitude(), currentState.getLongitude(), currentState.getHeight()),
+                new Point(currentState.getLatitude(), currentState.getLongitude(), aglM),
                 // Null until the gimbal and the coordinate transform have both
                 // reported. Gson drops null fields, so the frame still posts.
                 currentGimbal(), currentLens());
+        vehicleData.setAgl(aglM);
         Gson gson = new Gson();
         String vehicleDataJson = gson.toJson(vehicleData);
         // new JSONObject(...), not the raw string. Passing the String made
@@ -1150,6 +1210,34 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                                 ComponentIndexType.LEFT_OR_MAIN, CameraLensType.CAMERA_LENS_ZOOM), this)
                 .subscribe(ratio -> this.zoomRatio = ratio,
                         throwable -> LogUtils.e(TAG, "zoom ratio listener failed", throwable));
+    }
+
+
+    /**
+     * Timestamps for the server, in UTC with milliseconds.
+     *
+     * Two bugs lived in the old "yyyy-MM-dd HH:mm:ss" format, and together
+     * they made geolocation impossible:
+     *
+     *   No timezone. SimpleDateFormat defaults to the DEVICE's zone, so a
+     *   tablet in Greece sent 13:07 while the server's clock said 10:07. The
+     *   column is `timestamp without time zone`, so the value was stored
+     *   verbatim - every pose three hours in the future. PARM looks for a
+     *   pose near each frame's time, found none within hours of it, and
+     *   positioned nothing. Nothing logged an error: there was simply never
+     *   a pose to use.
+     *
+     *   No milliseconds. At 5 Hz, five samples an second collapsed onto one
+     *   timestamp, leaving the pose interpolator nothing to interpolate
+     *   between.
+     *
+     * ISO-8601 with an explicit Z fixes both, and is what the server's schema
+     * documents.
+     */
+    private static String utcTimestamp(long millis) {
+        SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+        iso.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return iso.format(new Date(millis));
     }
 
     /** Absolute gimbal pointing for the wire, or null if it is not yet known. */
@@ -1627,9 +1715,26 @@ public class DefaultLayoutActivity extends AppCompatActivity {
             showToast("Mission already started");
             return;
         }
+        // Already running on the server: this is a RESUME, not a start.
+        //
+        // The app crashing, the tablet sleeping, or the pilot closing it by
+        // accident leaves the mission InProgress with nothing publishing.
+        // Pressing Start then has to pick the flight back up - so announce no
+        // transition (the server would answer 200 unchanged, but saying a
+        // thing happened that did not is how the event log stops being
+        // trustworthy) and just resume the stream.
+        boolean alreadyRunning = "InProgress".equals(this.missionStatus)
+                || "Paused".equals(this.missionStatus);
+        if (alreadyRunning) {
+            this.missionStarted = true;
+            startLiveStream();
+            showToast("Mission resumed");
+            return;
+        }
         try {
             postMissionStatus("InProgress");
             this.missionStarted = true;
+            this.missionStatus = "InProgress";
             startLiveStream();
             showToast("Mission started");
         } catch (JSONException | IOException e) {
@@ -1659,6 +1764,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
             postMissionStatus("Completed");
             this.missionStarted = false;
             this.segmentOpen = false;
+            this.missionStatus = "Completed";
             stopLiveStream();
             showToast("Mission completed");
         } catch (JSONException | IOException e) {
@@ -1699,9 +1805,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
             params.put("action", action);
             // ISO-8601 UTC. The server discards a clock more than an hour out
             // rather than storing something misleading.
-            SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
-            iso.setTimeZone(TimeZone.getTimeZone("UTC"));
-            params.put("client_ts", iso.format(new Date(System.currentTimeMillis())));
+            params.put("client_ts", utcTimestamp(System.currentTimeMillis()));
         } catch (JSONException e) {
             Log.e("Segment", "could not build request", e);
             return;

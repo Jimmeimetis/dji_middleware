@@ -273,6 +273,24 @@
                 android:background="@android:color/darker_gray"
                 android:padding="8dp"/>
 
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="AGL offset (m)"
+                android:textColor="@color/white"
+                android:textSize="12sp" />
+
+            <EditText
+                android:id="@+id/etAglOffset"
+                android:hint="0"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="numberSigned|numberDecimal"
+                android:textColor="@color/white"
+                android:background="@android:color/darker_gray"
+                android:padding="8dp"/>
+
             <Button
                 android:id="@+id/btnSave"
                 android:layout_width="match_parent"
