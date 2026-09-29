@@ -144,6 +144,15 @@ abstract class DJIMainActivity : AppCompatActivity() {
         // is looking at. Geolocation intersects the camera ray with the
         // ground using AGL, so with a true AGL of 0 there is no height to
         // intersect from and nothing can be positioned.
+        // Bits per second, not kilobits: the DJI SDK's setLiveVideoBitrate takes
+        // a bare int and its own examples pass 2000000 for 2 Mbps. The unit is
+        // in the label because being wrong by a factor of a thousand is the
+        // difference between a stream and a slideshow.
+        //
+        // Worth raising if PARM reports fewer fps than it can process: a cap
+        // the uplink cannot fill makes the encoder drop frames rather than
+        // degrade quality, and PARM then sits input-starved.
+        binding.etRtmpBitrate.setText(prefs.getInt("rtmpBitrateBps", 3_000_000).toString())
         binding.etAglOffset.setText(prefs.getFloat("aglOffsetM", 0f).toString())
 
         binding.btnSave.setOnClickListener {
@@ -157,6 +166,12 @@ abstract class DJIMainActivity : AppCompatActivity() {
                 .putString("rtmpPass", binding.etRtmpPass.text.toString().trim())
                 // Blank or unparseable means no offset, rather than refusing
                 // to save the rest of the form over one bad field.
+                // Blank or unparseable falls back to the default rather than
+                // saving a zero, which would ask the encoder for no bitrate
+                // at all.
+                .putInt("rtmpBitrateBps",
+                    binding.etRtmpBitrate.text.toString().trim().toIntOrNull()
+                        ?.takeIf { it > 0 } ?: 3_000_000)
                 .putFloat("aglOffsetM",
                     binding.etAglOffset.text.toString().trim().toFloatOrNull() ?: 0f)
                 .apply()
