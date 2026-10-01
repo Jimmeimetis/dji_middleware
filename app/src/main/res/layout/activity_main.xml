@@ -309,6 +309,51 @@
                 android:background="@android:color/darker_gray"
                 android:padding="8dp"/>
 
+            <CheckBox
+                android:id="@+id/cbSeiPublish"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Publish SRT with pose in video (SEI)"
+                android:textColor="@color/white"
+                android:textSize="12sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Replaces the SDK's RTMP publish. Geolocation then reads the pose off each frame instead of pairing it with HTTP telemetry. Uses the camera's own bitrate (~6.4 Mbps), not the field above."
+                android:textColor="@color/white"
+                android:textSize="10sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="SRT host (blank = RTMP host) and port"
+                android:textColor="@color/white"
+                android:textSize="12sp" />
+
+            <EditText
+                android:id="@+id/etSrtHost"
+                android:hint="same as RTMP host"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:textColor="@color/white"
+                android:background="@android:color/darker_gray"
+                android:padding="8dp"/>
+
+            <EditText
+                android:id="@+id/etSrtPort"
+                android:hint="8890"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:inputType="number"
+                android:textColor="@color/white"
+                android:background="@android:color/darker_gray"
+                android:padding="8dp"/>
+
             <Button
                 android:id="@+id/btnSave"
                 android:layout_width="match_parent"

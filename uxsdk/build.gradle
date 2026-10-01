@@ -32,6 +32,64 @@ android {
 }
 
 dependencies {
+    // SRT client for publishing the camera stream ourselves, so the pose
+    // can be carried in the video's SEI. LiveStreamManager publishes
+    // internally with no hook to alter the bitstream, so injecting means
+    // taking over the push. This is the srt module alone, not the whole
+    // encoder: the aircraft already hands us encoded H.264 and we have
+    // nothing to encode.
+    //
+    // SRT rather than RTMP, and not for the link quality - though ARQ over
+    // a flaky uplink is a real bonus. It is the only transport in this
+    // library that can carry the frame we build.
+    //
+    // RTMP and RTSP both go through a packetiser that assumes ONE NAL per
+    // sendVideo call. com.pedro.rtmp's H264Packet writes a single 4-byte
+    // length over the whole buffer and takes the frame type from its first
+    // NAL, so an access unit of [SEI][IDR] arrives as one malformed NAL and
+    // loses its keyframe flag. RTSP is per-NAL by nature but marks every
+    // packet it emits, so the SEI would close the access unit and the
+    // picture would land in the next one.
+    //
+    // The MPEG-TS packetiser behind SRT copies the access unit into the PES
+    // payload verbatim - it only prepends an AUD and the parameter sets on
+    // keyframes, and strips nothing but the SPS/PPS it already knows. A
+    // multi-NAL access unit is the native form there. Measured end to end:
+    // 746/746 pose packets recovered with valid checksums after
+    // SRT -> MediaMTX -> RTMP, which is the path PARM reads.
+    //
+    // The -1.8.22 suffix matters: this project compiles with Kotlin 1.8.10,
+    // and the mainline RootEncoder builds carry Kotlin 2.2/2.3 metadata and
+    // drag in kotlin-stdlib 2.3.x, which the 1.8 compiler refuses outright
+    // ("binary version of its metadata is 2.2.0, expected 1.8.0"). pedroSG94
+    // publishes a parallel 1.8 line for exactly this.
+    // The stdlib exclusion is not optional. The -1.8.22 artifacts are
+    // COMPILED by Kotlin 1.8.22 but their POM still declares
+    // kotlin-stdlib:2.0.21, which Gradle resolves as an upgrade for the
+    // whole module - and the 1.8.10 compiler then cannot read it. The
+    // failure does not mention Kotlin or RootEncoder: it surfaces as
+    // "unresolved supertypes: ConstraintLayoutWidget<Object>" on this
+    // module's own widgets, as though the project had broken itself.
+    // Excluding it leaves the project's 1.8.10 stdlib in place, which is
+    // what this library's bytecode was built against anyway.
+    implementation('com.github.pedroSG94.RootEncoder:srt:2.5.4-1.8.22') {
+        exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib'
+        // RootEncoder's sockets are Ktor's, and Ktor 3.0.0 asks for
+        // slf4j-api 2.0.16, whose Level.class makes this AGP's D8 (R8
+        // 4.0.52) throw a NullPointerException - "Error while dexing", with
+        // no hint that slf4j or a version is involved. It breaks the APK
+        // build only, so it survives every compile task and surfaces at
+        // mergeExtDexDebug.
+        exclude group: 'org.slf4j', module: 'slf4j-api'
+    }
+    // Put slf4j back at a version that dexes. Ktor touches exactly four
+    // members of it - LoggerFactory.getLogger(String), Logger.trace,
+    // Logger.error(String, Throwable) and Logger.isTraceEnabled - all of
+    // which have been in slf4j since 1.x, so nothing it calls is missing
+    // here. No binding is supplied: slf4j-api with none logs one warning
+    // and discards everything, which is the right outcome for a library
+    // whose logs we do not want.
+    implementation 'org.slf4j:slf4j-api:1.7.36'
     implementation deps.annotation
     implementation deps.appcompat
     implementation deps.multidex

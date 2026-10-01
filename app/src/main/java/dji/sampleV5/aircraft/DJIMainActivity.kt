@@ -154,6 +154,13 @@ abstract class DJIMainActivity : AppCompatActivity() {
         // degrade quality, and PARM then sits input-starved.
         binding.etRtmpBitrate.setText(prefs.getInt("rtmpBitrateBps", 3_000_000).toString())
         binding.etAglOffset.setText(prefs.getFloat("aglOffsetM", 0f).toString())
+        // Off by default. Turning it on swaps the transport (SRT instead of
+        // the SDK's RTMP), the uplink bitrate (the camera's own encode, not
+        // the field above) and who owns reconnection - none of which should
+        // arrive with an app update.
+        binding.cbSeiPublish.isChecked = prefs.getBoolean("seiPublish", false)
+        binding.etSrtHost.setText(prefs.getString("srtHost", ""))
+        binding.etSrtPort.setText(prefs.getInt("srtPort", 8890).toString())
 
         binding.btnSave.setOnClickListener {
             prefs.edit()
@@ -174,6 +181,14 @@ abstract class DJIMainActivity : AppCompatActivity() {
                         ?.takeIf { it > 0 } ?: 3_000_000)
                 .putFloat("aglOffsetM",
                     binding.etAglOffset.text.toString().trim().toFloatOrNull() ?: 0f)
+                .putBoolean("seiPublish", binding.cbSeiPublish.isChecked)
+                // Blank means "the RTMP host": mediamtx answers RTMP and SRT
+                // on the same machine, and a second hostname to keep in step
+                // is a second thing to get wrong.
+                .putString("srtHost", binding.etSrtHost.text.toString().trim())
+                .putInt("srtPort",
+                    binding.etSrtPort.text.toString().trim().toIntOrNull()
+                        ?.takeIf { it in 1..65535 } ?: 8890)
                 .apply()
 
             ToastUtils.showToast("Values saved")

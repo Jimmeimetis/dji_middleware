@@ -50,6 +50,8 @@ import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
 import androidx.annotation.NonNull;
+
+import com.pedro.common.ConnectChecker;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.constraintlayout.widget.ConstraintLayout;
 import androidx.core.app.NotificationCompat;
@@ -248,6 +250,31 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     private float aglOffsetM = 0f;
     private IkarosStreamProbe seiProbe;
 
+    // ── Publishing the video ourselves, with the pose inside it ──────────
+    //
+    // Two mutually exclusive ways to get the camera off the aircraft:
+    //
+    //   seiPublish = false  LiveStreamManager pushes RTMP. The SDK owns
+    //                       reconnection and bitrate; geolocation pairs each
+    //                       frame with whichever HTTP telemetry sample landed
+    //                       nearest in time.
+    //   seiPublish = true   IkarosSeiPublisher pushes SRT, with the pose in
+    //                       each frame's SEI. No pairing and nothing to drift,
+    //                       at the cost of owning the publish - and of the
+    //                       camera's own ~6.4 Mbps encode instead of the
+    //                       3 Mbps the SDK was asked for.
+    //
+    // Default off. Turning it on changes the transport, the uplink bitrate
+    // and who handles a dropped connection, which is not something to inherit
+    // by upgrading.
+    private boolean seiPublish = false;
+    private IkarosSeiPublisher seiPublisher;
+    // SRT ingest. Same network load balancer as RTMP - mediamtx listens on
+    // both - so this defaults to the RTMP host rather than a second name to
+    // keep in step. MediaMTX's default SRT port is 8890/udp.
+    private String srtHost = null;   // null = use rtmpHost
+    private int srtPort = 8890;
+
     // ── Camera pose, for geolocation ──────────────────────────────────────
     //
     // 35 mm-equivalent focal length of this airframe's WIDE camera at 1x. The
@@ -407,6 +434,9 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         rtmpPass = prefs.getString("rtmpPass", rtmpPass);
         rtmpBitrateBps = prefs.getInt("rtmpBitrateBps", rtmpBitrateBps);
         aglOffsetM = prefs.getFloat("aglOffsetM", aglOffsetM);
+        seiPublish = prefs.getBoolean("seiPublish", seiPublish);
+        srtHost = prefs.getString("srtHost", srtHost);
+        srtPort = prefs.getInt("srtPort", srtPort);
         getProductUUIDAndShowToast();
         fpvParentView = findViewById(R.id.fpv_holder);
         mDrawerLayout = findViewById(R.id.root_view);
@@ -478,20 +508,18 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         // Keep decoder alive even if no preview surface is attached
         streamManager.setKeepAliveDecoding(true);
 
-        // Read-only probe answering whether we can publish the video
-        // ourselves - the prerequisite for carrying the aircraft's pose
-        // inside it. See IkarosStreamProbe for what it checks and why none
-        // of it can be settled off the aircraft. Off unless asked for, so a
-        // normal flight is unaffected; it only reads and logs.
-        // Defaults ON: there is no UI to set the preference, and the whole
-        // point of this build is to find out what onReceiveStream delivers.
-        // It only reads and logs once a second, so leaving it on costs a
-        // line in logcat and nothing else. Flip the default once the
-        // question is answered.
+        // Read-only probe. It answered its three questions on the aircraft -
+        // the listener fires with the live view up, the buffers are Annex-B,
+        // and presentationTimeMs is epoch - so it is off by default now and
+        // kept for the next time something about the stream is in doubt.
         seiProbe = new IkarosStreamProbe(streamManager);
-        if (prefs.getBoolean("seiProbe", true)) {
+        if (prefs.getBoolean("seiProbe", false)) {
             seiProbe.start(ComponentIndexType.find(0));
         }
+
+        // Constructed either way; it attaches to the camera only when
+        // startLiveStream() runs and seiPublish is on.
+        seiPublisher = new IkarosSeiPublisher(streamManager, this::currentSeiPose);
 
         try {
             // Replace with IP of the receiving machine and UDP port
@@ -585,6 +613,10 @@ public class DefaultLayoutActivity extends AppCompatActivity {
      * mission goes InProgress, and it needs something publishing to attach to.
      */
     private void startLiveStream() {
+        if (seiPublish) {
+            startSeiPublish();
+            return;
+        }
         if (liveStreamManager == null) {
             showToast("Live stream unavailable");
             return;
@@ -675,7 +707,117 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                 + "?user=" + user + "&pass=" + pass;
     }
 
+    /**
+     * Start publishing SRT ourselves, pose inside each frame.
+     *
+     * Replaces LiveStreamManager rather than running alongside it: both
+     * read the same camera and both would push a full stream up the same
+     * uplink, which is the one resource a drone has least of.
+     */
+    private void startSeiPublish() {
+        if (seiPublisher == null) {
+            showToast("Live stream unavailable");
+            return;
+        }
+        if (seiPublisher.isStreaming()) {
+            return;
+        }
+        seiPublisher.start(ComponentIndexType.find(0), buildSrtUrl(), new ConnectChecker() {
+            @Override
+            public void onConnectionStarted(@NonNull String url) {
+                Log.i("SRT", "connecting to " + IkarosSeiPublisher.redact(url));
+            }
+
+            @Override
+            public void onConnectionSuccess() {
+                Log.i("SRT", "publishing");
+            }
+
+            @Override
+            public void onConnectionFailed(@NonNull String reason) {
+                // Reconnection is ours now. One retry per failure with a
+                // fixed delay, rather than a backoff: a drone's link drops
+                // out and comes back, and a stream that waits a minute to
+                // retry has missed the part of the flight worth seeing.
+                Log.e("SRT", "connection failed: " + reason);
+                if (seiPublisher != null && seiPublisher.isStreaming()) return;
+                handler.postDelayed(() -> {
+                    if (seiPublish && missionStarted) startSeiPublish();
+                }, 3000);
+            }
+
+            @Override
+            public void onDisconnect() {
+                Log.i("SRT", "disconnected");
+            }
+
+            @Override
+            public void onAuthError() {
+                Log.e("SRT", "authentication rejected");
+                runOnUiThread(() -> showToast("Stream auth failed"));
+            }
+
+            @Override
+            public void onAuthSuccess() {
+                Log.i("SRT", "authenticated");
+            }
+        });
+    }
+
+    /**
+     * SRT publish URL for this aircraft.
+     *
+     * MediaMTX takes the credentials inside the streamid, not as URL
+     * userinfo: "publish:&lt;path&gt;:&lt;user&gt;:&lt;pass&gt;". RootEncoder reads a
+     * streamid query parameter when there is one and falls back to the URL
+     * path otherwise, so this reaches the handshake as written.
+     *
+     * The path is live/&lt;vehicleId&gt; for the same reason the RTMP one is:
+     * that is what the Ikaros player and PARM both subscribe to.
+     */
+    private String buildSrtUrl() {
+        String host = (srtHost == null || srtHost.isEmpty()) ? rtmpHost : srtHost;
+        // Not URL-encoded. The streamid is one opaque string to SRT, and
+        // percent-encoding it would hand mediamtx a password with literal
+        // %xx in it. The credentials are generated without characters that
+        // would need it.
+        return "srt://" + host + ":" + srtPort
+                + "?streamid=publish:live/" + vehicleId + ":" + rtmpUser + ":" + rtmpPass;
+    }
+
+    /**
+     * The pose to stamp on the current frame.
+     *
+     * Deliberately the same numbers postVehicleData() sends, read from the
+     * same place at the moment the frame is published - including the AGL
+     * offset, so a rooftop test geolocates through the video exactly as it
+     * does through the HTTP telemetry.
+     *
+     * Null until both the aircraft and the gimbal have reported. The
+     * publisher holds frames until then rather than stamping a default:
+     * a frame carrying 0,0 is worse than a frame carrying nothing, because
+     * PARM would geolocate it.
+     */
+    private IkarosSeiPublisher.Pose currentSeiPose() {
+        FlightControlState state = this.flightControlState.getValue();
+        if (state == null) return null;
+        CameraPose.Gimbal gimbal = currentGimbal();
+        if (gimbal == null) return null;
+        double heading = state.getHead();
+        if (heading < 0) heading += 360;
+        return new IkarosSeiPublisher.Pose(
+                state.getLatitude(), state.getLongitude(),
+                state.getHeight() + aglOffsetM, heading,
+                gimbal.getYaw(), gimbal.getPitch(), gimbal.getRoll());
+    }
+
     private void stopLiveStream() {
+        // Unconditionally, not behind seiPublish: the preference can be
+        // flipped while a publish is running, and the one thing worse than
+        // not starting is not stopping.
+        if (seiPublisher != null) {
+            seiPublisher.stop();
+        }
         if (liveStreamManager != null && liveStreamManager.isStreaming()) {
             liveStreamManager.stopStream(new CommonCallbacks.CompletionCallback() {
                 @Override
