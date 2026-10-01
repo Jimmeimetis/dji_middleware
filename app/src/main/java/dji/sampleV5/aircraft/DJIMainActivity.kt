@@ -59,6 +59,25 @@ abstract class DJIMainActivity : AppCompatActivity() {
 
         /** Comes from RTMP_PASS in secrets.properties. */
         private const val DEFAULT_RTMP_PASS = BuildConfig.RTMP_PASS
+
+        // ── Local docker-compose stack ───────────────────────────────
+        //
+        // The LAN address of the machine running ops/dev, from LOCAL_HOST
+        // in secrets.properties. NOT "localhost": on the tablet that means
+        // the tablet.
+        //
+        // The ports are fixed by the compose file rather than configurable
+        // - 3000 for the app, 1935 for RTMP, 8890 for SRT - so there is one
+        // thing to set instead of four that have to agree.
+        private val LOCAL_HOST = BuildConfig.LOCAL_HOST
+
+        /** Scheme and port included: the local app is plain HTTP on 3000,
+         *  not https on 443 like every AWS deployment. */
+        private val LOCAL_IKAROS_HOST = "http://$LOCAL_HOST:3000"
+        private val LOCAL_RTMP_HOST = LOCAL_HOST
+        private const val LOCAL_RTMP_USER = "ikaros"
+        private val LOCAL_RTMP_PASS = BuildConfig.LOCAL_RTMP_PASS
+        private val LOCAL_IKAROS_TOKEN = BuildConfig.LOCAL_IKAROS_TOKEN
     }
 
     val tag: String = LogUtils.getTag(this)
@@ -161,6 +180,42 @@ abstract class DJIMainActivity : AppCompatActivity() {
         binding.cbSeiPublish.isChecked = prefs.getBoolean("seiPublish", false)
         binding.etSrtHost.setText(prefs.getString("srtHost", ""))
         binding.etSrtPort.setText(prefs.getInt("srtPort", 8890).toString())
+
+        // Presets fill the form; Save is still a separate press.
+        //
+        // Buttons rather than changing the defaults, because the AWS values
+        // have to survive: switching to a local stack for an afternoon must
+        // not lose the way back. Nothing is written to prefs here, so a
+        // mis-tap costs nothing until Save.
+        binding.btnPresetAws.setOnClickListener {
+            binding.etIkarosHost.setText(DEFAULT_IKAROS_HOST)
+            binding.etFbdevToken.setText(DEFAULT_FBDEV_TOKEN)
+            binding.etRtmpHost.setText(DEFAULT_RTMP_HOST)
+            binding.etRtmpUser.setText(DEFAULT_RTMP_USER)
+            binding.etRtmpPass.setText(DEFAULT_RTMP_PASS)
+            binding.etSrtHost.setText("")
+            binding.etSrtPort.setText("8890")
+            ToastUtils.showToast("AWS dev01 filled in — press Save")
+        }
+
+        binding.btnPresetLocal.setOnClickListener {
+            if (LOCAL_HOST.isBlank()) {
+                // Better than filling the form with "http://:3000", which
+                // saves cleanly and then fails every request at runtime.
+                ToastUtils.showToast(
+                    "Set LOCAL_HOST in secrets.properties and rebuild")
+                return@setOnClickListener
+            }
+            binding.etIkarosHost.setText(LOCAL_IKAROS_HOST)
+            binding.etFbdevToken.setText(LOCAL_IKAROS_TOKEN)
+            binding.etRtmpHost.setText(LOCAL_RTMP_HOST)
+            binding.etRtmpUser.setText(LOCAL_RTMP_USER)
+            binding.etRtmpPass.setText(LOCAL_RTMP_PASS)
+            // Blank means "same as the RTMP host", which is what we just set.
+            binding.etSrtHost.setText("")
+            binding.etSrtPort.setText("8890")
+            ToastUtils.showToast("Local stack ($LOCAL_HOST) filled in — press Save")
+        }
 
         binding.btnSave.setOnClickListener {
             prefs.edit()

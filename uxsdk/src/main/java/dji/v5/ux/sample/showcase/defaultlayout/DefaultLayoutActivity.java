@@ -218,7 +218,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     // Ikaros API. HTTPS on 443 through the load balancer; there is no public
     // port 3000 any more, and the old :3000 URLs cannot connect.
     private String ikarosHost = "ikaros-dev01.autonoma-solutions.eu";
-    private String apiBase = "https://" + ikarosHost;
+    private String apiBase = apiBaseFor(ikarosHost);
 
     // RTMP ingest is a DIFFERENT hostname on purpose. The API is behind an
     // application load balancer, which only speaks HTTP and cannot carry
@@ -428,7 +428,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         userId = prefs.getString("userId", userId);
         wardenIP = prefs.getString("wardenIP", wardenIP);
         ikarosHost = prefs.getString("ikarosHost", ikarosHost);
-        apiBase = "https://" + ikarosHost;
+        apiBase = apiBaseFor(ikarosHost);
         rtmpHost = prefs.getString("rtmpHost", rtmpHost);
         rtmpUser = prefs.getString("rtmpUser", rtmpUser);
         rtmpPass = prefs.getString("rtmpPass", rtmpPass);
@@ -762,6 +762,25 @@ public class DefaultLayoutActivity extends AppCompatActivity {
                 Log.i("SRT", "authenticated");
             }
         });
+    }
+
+    /**
+     * API origin for a configured host.
+     *
+     * A bare hostname gets https, which is every AWS deployment: they sit
+     * behind the load balancer on 443 and there is no plain-HTTP port.
+     *
+     * A host that already carries a scheme is taken as written, so a local
+     * docker-compose stack can be reached at http://&lt;lan-ip&gt;:3000. Without
+     * this the scheme was welded on and a local stack was unreachable -
+     * the app would try https against a port serving plain HTTP and every
+     * request would fail handshake, which reads like the server being down.
+     */
+    static String apiBaseFor(String host) {
+        String h = host == null ? "" : host.trim();
+        // Trailing slash would double up against the "/api/..." suffixes.
+        while (h.endsWith("/")) h = h.substring(0, h.length() - 1);
+        return h.contains("://") ? h : "https://" + h;
     }
 
     /**
