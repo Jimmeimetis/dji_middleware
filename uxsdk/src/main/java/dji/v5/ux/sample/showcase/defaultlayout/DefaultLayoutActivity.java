@@ -246,6 +246,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     // Geolocation intersects the camera ray with the ground plane using AGL,
     // so an AGL of 0 gives it no height to work from and positions nothing.
     private float aglOffsetM = 0f;
+    private IkarosStreamProbe seiProbe;
 
     // ── Camera pose, for geolocation ──────────────────────────────────────
     //
@@ -476,6 +477,16 @@ public class DefaultLayoutActivity extends AppCompatActivity {
 
         // Keep decoder alive even if no preview surface is attached
         streamManager.setKeepAliveDecoding(true);
+
+        // Read-only probe answering whether we can publish the video
+        // ourselves - the prerequisite for carrying the aircraft's pose
+        // inside it. See IkarosStreamProbe for what it checks and why none
+        // of it can be settled off the aircraft. Off unless asked for, so a
+        // normal flight is unaffected; it only reads and logs.
+        seiProbe = new IkarosStreamProbe(streamManager);
+        if (prefs.getBoolean("seiProbe", false)) {
+            seiProbe.start(ComponentIndexType.find(0));
+        }
 
         try {
             // Replace with IP of the receiving machine and UDP port
