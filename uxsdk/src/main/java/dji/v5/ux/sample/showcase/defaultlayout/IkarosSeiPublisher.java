@@ -46,6 +46,26 @@ public final class IkarosSeiPublisher {
     private static final String TAG = "IkarosSeiPub";
 
     /**
+     * How full the send cache may get before frames start being dropped.
+     *
+     * Low on purpose. The cache exists to ride out a brief stall, not to
+     * store video: anything sitting in it is already late by the time it
+     * would be sent, and a drone operator wants the current picture, not a
+     * complete one.
+     */
+    private static final float CONGESTION_PCT = 20f;
+
+    /**
+     * Send-cache size, in items.
+     *
+     * At 30 fps this is about two seconds - enough to absorb a hiccup,
+     * bounded enough that a sustained shortfall cannot eat the heap. The
+     * default is far larger, which is what let the queue grow until the
+     * process was killed.
+     */
+    private static final int CACHE_FRAMES = 60;
+
+    /**
      * Where the pose comes from, sampled per frame.
      *
      * A supplier rather than a setter: the aircraft's state is already
@@ -103,6 +123,23 @@ public final class IkarosSeiPublisher {
      */
     private long firstPtsMs = Long.MIN_VALUE;
 
+    /**
+     * Last PTS actually sent, so the stream never steps backwards.
+     *
+     * getPresentationTimeMs is MOSTLY monotonic - the probe measured it as
+     * such over a flight - but "mostly" is not the guarantee a muxer needs.
+     * It occasionally repeats or goes back a frame or two, and MediaMTX does
+     * not tolerate it: "DTS is not monotonically increasing, was 119413710,
+     * now is 119408130" and it DROPS EVERY READER on the path. PARM's two
+     * connections died together, reconnected, and the recorder logged drift
+     * and reset - from one 62 ms step backwards.
+     *
+     * So the publisher's clock is derived from the aircraft's but enforced
+     * here. The KLV keeps the aircraft's real capture time, which is the
+     * one geolocation uses; this only governs presentation order.
+     */
+    private long lastPtsUs = Long.MIN_VALUE;
+
     // Reported once a second rather than per frame: at 30 fps a per-frame
     // line is 30 lines a second of logcat during a flight.
     private long windowStartMs;
@@ -110,6 +147,18 @@ public final class IkarosSeiPublisher {
     private int framesOut;
     private int droppedNoPose;
     private int droppedNoConfig;
+    private int backwardsPts;
+    private int droppedCongested;
+
+    /**
+     * Once behind, drop whole GOPs rather than individual frames.
+     *
+     * A P-frame references the ones before it, so dropping an arbitrary
+     * frame corrupts every frame after it until the next IDR - the decoder
+     * shows smeared blocks rather than a clean gap. Skipping to the next
+     * keyframe costs the same video but resumes cleanly.
+     */
+    private boolean skipUntilKeyframe;
 
     public IkarosSeiPublisher(ICameraStreamManager streamManager, PoseSource poseSource) {
         this.streamManager = streamManager;
@@ -145,6 +194,8 @@ public final class IkarosSeiPublisher {
         pps = null;
         videoInfoSent = false;
         firstPtsMs = Long.MIN_VALUE;
+        lastPtsUs = Long.MIN_VALUE;
+        skipUntilKeyframe = false;
         windowStartMs = System.currentTimeMillis();
 
         srtClient = new SrtClient(checker);
@@ -153,6 +204,7 @@ public final class IkarosSeiPublisher {
         // never arrive.
         srtClient.setOnlyVideo(true);
         srtClient.setVideoCodec(VideoCodec.H264);
+        srtClient.resizeCache(CACHE_FRAMES);
         srtClient.connect(url);
 
         listener = (buffer, offset, length, streamInfo) ->
@@ -214,6 +266,17 @@ public final class IkarosSeiPublisher {
         long ptsMs = (info == null) ? System.currentTimeMillis() : info.getPresentationTimeMs();
         if (firstPtsMs == Long.MIN_VALUE) firstPtsMs = ptsMs;
 
+        // Monotonic, strictly. A repeated or reversed timestamp is nudged to
+        // one microsecond past the last - which keeps presentation order
+        // correct and is far below anything a decoder resolves, rather than
+        // inventing a frame interval we do not know.
+        long ptsUs = (ptsMs - firstPtsMs) * 1000L;
+        if (lastPtsUs != Long.MIN_VALUE && ptsUs <= lastPtsUs) {
+            backwardsPts++;
+            ptsUs = lastPtsUs + 1;
+        }
+        lastPtsUs = ptsUs;
+
         // The KLV timestamp is the aircraft's capture time in epoch
         // microseconds - the whole point of using presentationTimeMs rather
         // than the controller's clock, which is late by the uplink latency.
@@ -221,12 +284,45 @@ public final class IkarosSeiPublisher {
                 ptsMs * 1000L,
                 pose.lat, pose.lon, pose.altM, pose.headingDeg,
                 pose.gimbalYawDeg, pose.gimbalPitchDeg, pose.gimbalRollDeg);
+        // Parameter sets out first, THEN the pose in. Leaving SPS/PPS in the
+        // access unit overflows a buffer inside the packetiser and kills the
+        // sender on the first keyframe - see stripParameterSets.
+        byte[] slices = IkarosSeiInjector.stripParameterSets(b, offset, length);
         byte[] au = IkarosSeiInjector.insertBeforeFirstSlice(
-                b, offset, length, IkarosSei.buildSeiNal(klv));
+                slices, 0, slices.length, IkarosSei.buildSeiNal(klv));
+
+        // CONGESTION: drop, do not queue.
+        //
+        // onReceiveStream hands us the camera's own ~6.4 Mbps encode, which
+        // is roughly twice what LiveStreamManager was configured to push and
+        // more than this uplink reliably carries. SRT answers a shortfall by
+        // buffering, and the queue is bounded only by the heap - so it grew
+        // until the link was 6 SECONDS behind (measured: msRTT 6019-6144 ms
+        // at the server) and then until the app died:
+        //
+        //   OutOfMemoryError: Failed to allocate 101784 bytes with 18352
+        //   free, growth limit 268435456
+        //
+        // The video was never going to arrive; queueing it only chose how
+        // late it would be and when the process would run out of memory.
+        // Dropping keeps latency bounded and the app alive, and the stream
+        // degrades the way a congested video link is supposed to.
+        boolean keyframe = containsIdr(b, offset, length);
+        if (skipUntilKeyframe && !keyframe) {
+            droppedCongested++;
+            report();
+            return;
+        }
+        if (!keyframe && client.hasCongestion(CONGESTION_PCT)) {
+            skipUntilKeyframe = true;
+            droppedCongested++;
+            report();
+            return;
+        }
+        skipUntilKeyframe = false;
 
         MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
-        bi.set(0, au.length, (ptsMs - firstPtsMs) * 1000L,
-                containsIdr(b, offset, length) ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
+        bi.set(0, au.length, ptsUs, keyframe ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
         client.sendVideo(ByteBuffer.wrap(au), bi);
         framesOut++;
         report();
@@ -297,15 +393,30 @@ public final class IkarosSeiPublisher {
     private void report() {
         long now = System.currentTimeMillis();
         if (now - windowStartMs < 1000) return;
-        Log.i(TAG, framesIn + " in / " + framesOut + " out per s"
+        // sent/dropped come from the CLIENT, and they are the numbers that
+        // matter. "out" only counts frames handed to sendVideo, which
+        // enqueues - so when the sender coroutine died on a buffer overflow,
+        // this line read "30 in / 30 out, streaming=true" while the server
+        // was receiving nothing whatsoever. A publish can fail in a way that
+        // looks, from here, exactly like a publish that works.
+        SrtClient c = srtClient;
+        long sent = c == null ? -1 : c.getSentVideoFrames();
+        long dropped = c == null ? -1 : c.getDroppedVideoFrames();
+        Log.i(TAG, framesIn + " in / " + framesOut + " queued per s"
+                + "  sent=" + sent + " dropped=" + dropped
                 + "  droppedNoPose=" + droppedNoPose
                 + "  droppedNoConfig=" + droppedNoConfig
+                + "  backwardsPts=" + backwardsPts
+                + "  droppedCongested=" + droppedCongested
+                + "  cache=" + (c == null ? -1 : c.getItemsInCache())
                 + "  streaming=" + isStreaming());
         windowStartMs = now;
         framesIn = 0;
         framesOut = 0;
         droppedNoPose = 0;
         droppedNoConfig = 0;
+        backwardsPts = 0;
+        droppedCongested = 0;
     }
 
     /** The streamid carries the publish password; keep it out of logcat. */
