@@ -47,6 +47,18 @@ public final class IkarosStreamProbe {
     private int nalTypesSeen;   // bitmask of NAL types 0..31
     private boolean loggedFirst;
 
+    // StreamInfo.getPresentationTimeMs: the only per-buffer time the SDK
+    // offers here, and the probe's second question. The raw stream carries
+    // no SEI (measured: nalTypes=[1 5 7 8], withDjiSei=0/30), so DJI's
+    // capture timestamp is added by the publishing pipeline and is lost to
+    // anyone who publishes themselves. If this field is the aircraft's
+    // clock, a custom publisher can still stamp honestly; if it is a local
+    // or relative counter, the best available time is the controller's at
+    // injection, short by the aircraft-to-controller latency.
+    private long firstPts = Long.MIN_VALUE;
+    private long lastPts = Long.MIN_VALUE;
+    private boolean ptsMonotonic = true;
+
     public IkarosStreamProbe(ICameraStreamManager streamManager) {
         this.streamManager = streamManager;
     }
@@ -92,8 +104,23 @@ public final class IkarosStreamProbe {
         }
         if (sawDjiSei) withDjiSei++;
 
+        long pts = (info == null) ? Long.MIN_VALUE : info.getPresentationTimeMs();
+        if (pts != Long.MIN_VALUE) {
+            if (firstPts == Long.MIN_VALUE) firstPts = pts;
+            if (lastPts != Long.MIN_VALUE && pts < lastPts) ptsMonotonic = false;
+            lastPts = pts;
+        }
+
         if (!loggedFirst) {
             loggedFirst = true;
+            long nowMs = System.currentTimeMillis();
+            Log.i(TAG, "presentationTimeMs=" + pts
+                    + "  wallClock=" + nowMs
+                    + "  delta=" + (nowMs - pts) + "ms"
+                    + "  -> " + (Math.abs(nowMs - pts) < 86400000L
+                        ? "EPOCH-LIKE: usable as a capture time"
+                        : "NOT epoch: a relative counter, so a custom publisher "
+                          + "must stamp with the controller's clock"));
             Log.i(TAG, "FIRST BUFFER — the listener DOES fire with the live view up."
                     + " len=" + length + " annexB=" + isAnnexB
                     + " mime=" + (info == null ? "?" : String.valueOf(info.getMimeType()))
@@ -108,9 +135,11 @@ public final class IkarosStreamProbe {
                 if ((nalTypesSeen & (1 << t)) != 0) types.append(t).append(' ');
             }
             Log.i(TAG, String.format(
-                    "%d buf/s  %.0f kB/s  annexB=%d/%d  withDjiSei=%d/%d  nalTypes=[%s]",
+                    "%d buf/s  %.0f kB/s  annexB=%d/%d  withDjiSei=%d/%d  nalTypes=[%s]"
+                            + "  pts=%d (lag %dms, monotonic=%b)",
                     buffers, bytes / 1024.0, annexB, buffers, withDjiSei, buffers,
-                    types.toString().trim()));
+                    types.toString().trim(),
+                    lastPts, now - lastPts, ptsMonotonic));
             windowStartMs = now;
             buffers = 0;
             bytes = 0;

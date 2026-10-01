@@ -483,8 +483,13 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         // inside it. See IkarosStreamProbe for what it checks and why none
         // of it can be settled off the aircraft. Off unless asked for, so a
         // normal flight is unaffected; it only reads and logs.
+        // Defaults ON: there is no UI to set the preference, and the whole
+        // point of this build is to find out what onReceiveStream delivers.
+        // It only reads and logs once a second, so leaving it on costs a
+        // line in logcat and nothing else. Flip the default once the
+        // question is answered.
         seiProbe = new IkarosStreamProbe(streamManager);
-        if (prefs.getBoolean("seiProbe", false)) {
+        if (prefs.getBoolean("seiProbe", true)) {
             seiProbe.start(ComponentIndexType.find(0));
         }
 
