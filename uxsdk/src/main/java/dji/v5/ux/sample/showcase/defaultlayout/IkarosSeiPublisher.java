@@ -105,6 +105,58 @@ public final class IkarosSeiPublisher {
 
     private SrtClient srtClient;
     private ICameraStreamManager.ReceiveStreamListener listener;
+    private ICameraStreamManager.CameraFrameListener frameListener;
+    private IkarosFrameEncoder encoder;
+    private IkarosRtmpPublisher rtmp;
+
+    /**
+     * Adaptive bitrate, deliberately two-state.
+     *
+     * A link that cannot carry the stream has to give something up. Dropping
+     * frames is the visible choice - and because a P-frame needs the ones
+     * before it we must skip to the next keyframe, so one late frame costs a
+     * run of them. Lowering the bitrate gives up detail instead and keeps the
+     * motion, which is what someone watching people move around a site needs.
+     *
+     * Two levels, not a control loop. Gradual multiplicative stepping sounds
+     * better and is where these things go wrong: it hunts, it interacts with
+     * the encoder's own rate control, and when it misbehaves at 400 ft the
+     * logs show a dozen intermediate rates and no clear story. Ceiling or
+     * floor, with hysteresis on the way back up, is predictable and easy to
+     * read off a log line.
+     *
+     * FLOOR is 2 Mbps and that is a hard limit, not a target: below it the
+     * picture stops being good enough to inspect PPE from, which is the whole
+     * job. If the operator sets the ceiling AT the floor - as 2 Mbps does -
+     * there is nothing to give up and adaptation turns itself off rather than
+     * pretending to work.
+     */
+    private static final int BITRATE_FLOOR_BPS = 2_000_000;
+    private static final float PRESSURE_DOWN = 0.5f;
+    private static final int CLEAR_SECONDS_BEFORE_UP = 5;
+
+    /**
+     * Tag 2 carries the CONTROLLER's clock, and that was measured, not assumed.
+     *
+     * The alternative was the aircraft's own presentationTimeMs off
+     * addReceiveStreamListener. Running both for a minute: the two agreed to
+     * within 2-9 ms on average, so the aircraft clock buys nothing - and it
+     * arrives through a "latest frame info" read rather than with our frame,
+     * which added a +/-20 ms frame race (one frame at 30 fps). Simpler clock,
+     * no race, same answer.
+     *
+     * Neither is the true exposure time: both are "when the RC handled the
+     * frame". That lateness is systematic, so it cancels between two aircraft
+     * of the same type - but it would NOT cancel across airframes with
+     * different downlink latencies, which matters if detections from several
+     * drones are ever merged by timestamp.
+     */
+    private boolean adaptive;
+    private int bitrateCeilingBps;
+    private int bitrateNowBps;
+    private int clearSeconds;
+    private int targetBitrateBps;
+    private int targetFps;
     private ComponentIndexType camera;
 
     private byte[] sps;
@@ -149,6 +201,9 @@ public final class IkarosSeiPublisher {
     private int droppedNoConfig;
     private int backwardsPts;
     private int droppedCongested;
+    private int droppedEncoderFull;
+    private int droppedToRate;
+    private int droppedLinkFull;
 
     /**
      * Once behind, drop whole GOPs rather than individual frames.
@@ -213,7 +268,260 @@ public final class IkarosSeiPublisher {
         Log.i(TAG, "publishing camera " + cameraIndex + " to " + redact(url));
     }
 
+    /**
+     * Publish RTMP, encoding the frames ourselves. This is the working path.
+     *
+     * The alternatives were each ruled out by measurement, and the reasoning
+     * lives in IkarosRtmpClient so it is next to the code that replaced them.
+     * In short: RootEncoder's SRT held about 20 seconds of video on arrival,
+     * its RTMP wrote one length prefix over a multi-NAL access unit, its fixed
+     * release needs a Kotlin this project does not have, and ffmpeg-kit
+     * collides with the ffmpeg the DJI SDK already bundles.
+     */
+    public void startEncodingRtmp(ComponentIndexType cameraIndex, String rtmpUrl,
+                                  int bitrateBps, int fps, boolean adaptiveBitrate,
+                                  IkarosRtmpPublisher.Listener l) {
+        if (listener != null || frameListener != null) {
+            Log.w(TAG, "already started");
+            return;
+        }
+        camera = cameraIndex;
+        sps = null;
+        pps = null;
+        videoInfoSent = false;
+        lastPtsUs = Long.MIN_VALUE;
+        skipUntilKeyframe = false;
+        windowStartMs = System.currentTimeMillis();
+        targetBitrateBps = bitrateBps;
+        targetFps = fps;
+        adaptive = adaptiveBitrate;
+        bitrateCeilingBps = bitrateBps;
+        bitrateNowBps = bitrateBps;
+        clearSeconds = 0;
+
+        rtmp = new IkarosRtmpPublisher(fps);
+        rtmp.start(rtmpUrl, l);
+
+        encoder = new IkarosFrameEncoder(new IkarosFrameEncoder.Sink() {
+            @Override
+            public void onConfig(byte[] s0, byte[] p0) {
+                if (s0 == null || p0 == null || s0.length < 5 || p0.length < 5) {
+                    Log.e(TAG, "ignoring malformed parameter sets");
+                    return;
+                }
+                sps = s0;
+                pps = p0;
+                IkarosRtmpPublisher r = rtmp;
+                if (r != null) r.setParameterSets(s0, p0);
+                Log.i(TAG, "have parameter sets: sps=" + s0.length + "B pps=" + p0.length + "B");
+            }
+
+            @Override
+            public void onEncoded(byte[] au, long ptsUs, boolean keyframe) {
+                sendAuRtmp(au, keyframe);
+            }
+        });
+
+        frameListener = (data, offset, length, width, height, format) -> {
+            try {
+                framesIn++;
+                IkarosFrameEncoder e = encoder;
+                if (e == null) return;
+                e.encode(data, offset, length, width, height, format, targetBitrateBps, targetFps);
+                droppedEncoderFull += e.takeDroppedNoInputBuffer();
+                droppedToRate += e.takeDroppedToRate();
+                IkarosRtmpPublisher r = rtmp;
+                if (r != null) droppedLinkFull += r.takeDroppedQueueFull();
+                report();
+            } catch (Throwable t) {
+                Log.e(TAG, "frame dropped on error", t);
+            }
+        };
+        streamManager.addFrameListener(cameraIndex,
+                ICameraStreamManager.FrameFormat.NV21, frameListener);
+        Log.i(TAG, "publishing camera " + cameraIndex + " at " + bitrateBps + " bps, " + fps + " fps"
+                + (!adaptiveBitrate
+                   ? " (adaptation off by setting)"
+                   : bitrateBps <= BITRATE_FLOOR_BPS
+                     ? " (adaptation on, but inert: ceiling is at or below the "
+                       + BITRATE_FLOOR_BPS + " bps floor)"
+                     : " (adaptation on: floor " + BITRATE_FLOOR_BPS + " bps)"));
+    }
+
+    /**
+     * Hold the ceiling, or fall back to the floor. Nothing in between.
+     *
+     * Pressure is read from the queue rather than from drops, so the rate
+     * comes down BEFORE frames are lost - by the time droppedLinkFull is
+     * counting, the operator has already seen the stutter.
+     */
+    private void govern(IkarosRtmpPublisher r) {
+        if (!adaptive) return;
+        if (bitrateCeilingBps <= BITRATE_FLOOR_BPS) return;   // nothing to give up
+
+        boolean strained = droppedLinkFull > 0 || r.queuePressure() >= PRESSURE_DOWN;
+
+        if (strained) {
+            clearSeconds = 0;
+            if (bitrateNowBps != BITRATE_FLOOR_BPS) {
+                bitrateNowBps = BITRATE_FLOOR_BPS;
+                IkarosFrameEncoder e = encoder;
+                if (e != null) e.setBitrate(bitrateNowBps);
+                Log.i(TAG, "link strained, bitrate to floor " + bitrateNowBps + " bps");
+            }
+            return;
+        }
+
+        if (bitrateNowBps >= bitrateCeilingBps) { clearSeconds = 0; return; }
+        if (++clearSeconds < CLEAR_SECONDS_BEFORE_UP) return;
+        clearSeconds = 0;
+        bitrateNowBps = bitrateCeilingBps;
+        IkarosFrameEncoder e = encoder;
+        if (e != null) e.setBitrate(bitrateNowBps);
+        Log.i(TAG, "link clear, bitrate back to ceiling " + bitrateNowBps + " bps");
+    }
+
+    /**
+     * Weld the pose in and hand the access unit to the RTMP writer.
+     *
+     * Parameter sets are stripped: they travel once, in the AVC sequence
+     * header, which is where AVCC expects them. The SEI goes before the first
+     * slice, and IkarosRtmpClient gives every NAL its own length prefix - so
+     * the pose and the picture arrive as one access unit, intact.
+     */
+    private void sendAuRtmp(byte[] au, boolean keyframe) {
+        IkarosRtmpPublisher r = rtmp;
+        if (r == null) return;
+
+        Pose pose = poseSource.currentPose();
+        if (pose == null) { droppedNoPose++; report(); return; }
+        if (sps == null || pps == null) { droppedNoConfig++; report(); return; }
+
+        byte[] klv = IkarosSei.encodeMisb0601(
+                System.currentTimeMillis() * 1000L,
+                pose.lat, pose.lon, pose.altM, pose.headingDeg,
+                pose.gimbalYawDeg, pose.gimbalPitchDeg, pose.gimbalRollDeg);
+
+        byte[] slices = IkarosSeiInjector.stripParameterSets(au, 0, au.length);
+        byte[] withSei = IkarosSeiInjector.insertBeforeFirstSlice(
+                slices, 0, slices.length, IkarosSei.buildSeiNal(klv));
+
+        if (r.write(withSei, keyframe)) framesOut++;
+        report();
+    }
+
+    /**
+     * Connect and publish, encoding the frames ourselves at `bitrateBps`.
+     *
+     * The difference from start() is WHERE the H.264 comes from. start()
+     * forwards the RC's own encode, whose bitrate the SDK will not let us
+     * set on this hardware - setStreamEncoderBitrate answered the request
+     * with readback -1, and the RC's encoder ran at 6.6 to 11 Mbps. Over a
+     * weak uplink that does not drain: the server sat on a 12.9 MB receive
+     * buffer at 5.6 SECONDS RTT with almost no packet loss, about 15s of
+     * video late, which is the lag PARM and the operator saw.
+     *
+     * Here addFrameListener gives decoded frames and IkarosFrameEncoder
+     * re-encodes them at a rate we choose. The pose injection is unchanged -
+     * the SEI still goes in before the first slice of every access unit.
+     */
+    public void startEncoding(ComponentIndexType cameraIndex, String url, ConnectChecker checker,
+                              int bitrateBps, int fps) {
+        if (listener != null || frameListener != null) {
+            Log.w(TAG, "already started");
+            return;
+        }
+        camera = cameraIndex;
+        sps = null;
+        pps = null;
+        videoInfoSent = false;
+        firstPtsMs = Long.MIN_VALUE;
+        lastPtsUs = Long.MIN_VALUE;
+        skipUntilKeyframe = false;
+        windowStartMs = System.currentTimeMillis();
+        targetBitrateBps = bitrateBps;
+        targetFps = fps;
+
+        srtClient = new SrtClient(checker);
+        srtClient.setOnlyVideo(true);
+        srtClient.setVideoCodec(VideoCodec.H264);
+        srtClient.resizeCache(CACHE_FRAMES);
+        srtClient.connect(url);
+
+        encoder = new IkarosFrameEncoder(new IkarosFrameEncoder.Sink() {
+            @Override
+            public void onConfig(byte[] s0, byte[] p0) {
+                // Sanity-check before handing these to the packetiser. It
+                // reads a start code off the front without checking the
+                // length, so a short buffer is a FATAL exception on DJI's
+                // dispatcher thread rather than an error we can recover from
+                // - which is exactly how the first build of this path died.
+                if (s0 == null || p0 == null || s0.length < 5 || p0.length < 5) {
+                    Log.e(TAG, "ignoring malformed parameter sets: sps="
+                            + (s0 == null ? -1 : s0.length) + "B pps="
+                            + (p0 == null ? -1 : p0.length) + "B");
+                    return;
+                }
+                sps = s0;
+                pps = p0;
+                SrtClient c = srtClient;
+                if (c != null && !videoInfoSent) {
+                    c.setVideoInfo(ByteBuffer.wrap(sps), ByteBuffer.wrap(pps), null);
+                    videoInfoSent = true;
+                    Log.i(TAG, "sent video config: sps=" + sps.length + "B pps=" + pps.length + "B");
+                }
+            }
+
+            @Override
+            public void onEncoded(byte[] au, long ptsUs, boolean keyframe) {
+                sendAu(au, 0, au.length, ptsUs, keyframe);
+            }
+        });
+
+        // NV21 rather than YUV420_888: it is already semi-planar, so the
+        // conversion to the encoder's NV12 is a chroma swap instead of an
+        // interleave of two separate planes.
+        // Anything thrown here lands on DJI's GLFrameDispatcher thread and
+        // takes the whole app down with it, mid-flight. A failed frame is
+        // worth a log line; it is not worth the aircraft losing its app.
+        frameListener = (data, offset, length, width, height, format) -> {
+            try {
+                framesIn++;
+                IkarosFrameEncoder e = encoder;
+                if (e == null) return;
+                e.encode(data, offset, length, width, height, format, targetBitrateBps, targetFps);
+                droppedCongested += e.takeDroppedNoInputBuffer();
+                report();
+            } catch (Throwable t) {
+                Log.e(TAG, "frame dropped on error", t);
+            }
+        };
+        streamManager.addFrameListener(cameraIndex,
+                ICameraStreamManager.FrameFormat.NV21, frameListener);
+        Log.i(TAG, "publishing camera " + cameraIndex + " to " + redact(url)
+                + " re-encoded at " + bitrateBps + " bps");
+    }
+
+    /** Change the publish bitrate mid-flight. Only meaningful while encoding. */
+    public void setBitrate(int bps) {
+        targetBitrateBps = bps;
+        IkarosFrameEncoder e = encoder;
+        if (e != null) e.setBitrate(bps);
+    }
+
     public void stop() {
+        if (frameListener != null) {
+            streamManager.removeFrameListener(frameListener);
+            frameListener = null;
+        }
+        if (encoder != null) {
+            encoder.release();
+            encoder = null;
+        }
+        if (rtmp != null) {
+            rtmp.stop();
+            rtmp = null;
+        }
         if (listener != null) {
             streamManager.removeReceiveStreamListener(listener);
             listener = null;
@@ -253,16 +561,6 @@ public final class IkarosSeiPublisher {
             Log.i(TAG, "sent video config: sps=" + sps.length + "B pps=" + pps.length + "B");
         }
 
-        Pose pose = poseSource.currentPose();
-        if (pose == null) {
-            // Publishing frames with no pose would produce video PARM cannot
-            // geolocate, silently. Better to hold until the aircraft reports
-            // one - that is seconds at startup, not a flight-long failure.
-            droppedNoPose++;
-            report();
-            return;
-        }
-
         long ptsMs = (info == null) ? System.currentTimeMillis() : info.getPresentationTimeMs();
         if (firstPtsMs == Long.MIN_VALUE) firstPtsMs = ptsMs;
 
@@ -280,8 +578,38 @@ public final class IkarosSeiPublisher {
         // The KLV timestamp is the aircraft's capture time in epoch
         // microseconds - the whole point of using presentationTimeMs rather
         // than the controller's clock, which is late by the uplink latency.
+        sendAu(b, offset, length, ptsUs, containsIdr(b, offset, length), ptsMs * 1000L);
+    }
+
+    /**
+     * Weld the pose into one access unit and hand it to the SRT client.
+     *
+     * Shared by both paths: forwarding the RC's encode, and publishing our
+     * own. They differ only in where the bytes and the timestamps come from -
+     * the SEI, the parameter-set handling and the congestion rule are the
+     * same work and belong in one place.
+     */
+    private void sendAu(byte[] b, int offset, int length, long ptsUs, boolean keyframe) {
+        sendAu(b, offset, length, ptsUs, keyframe, System.currentTimeMillis() * 1000L);
+    }
+
+    private void sendAu(byte[] b, int offset, int length, long ptsUs, boolean keyframe,
+                        long klvEpochUs) {
+        SrtClient client = srtClient;
+        if (client == null) return;
+
+        Pose pose = poseSource.currentPose();
+        if (pose == null) {
+            // Publishing frames with no pose would produce video PARM cannot
+            // geolocate, silently. Better to hold until the aircraft reports
+            // one - that is seconds at startup, not a flight-long failure.
+            droppedNoPose++;
+            report();
+            return;
+        }
+
         byte[] klv = IkarosSei.encodeMisb0601(
-                ptsMs * 1000L,
+                klvEpochUs,
                 pose.lat, pose.lon, pose.altM, pose.headingDeg,
                 pose.gimbalYawDeg, pose.gimbalPitchDeg, pose.gimbalRollDeg);
         // Parameter sets out first, THEN the pose in. Leaving SPS/PPS in the
@@ -307,7 +635,6 @@ public final class IkarosSeiPublisher {
         // late it would be and when the process would run out of memory.
         // Dropping keeps latency bounded and the app alive, and the stream
         // degrades the way a congested video link is supposed to.
-        boolean keyframe = containsIdr(b, offset, length);
         if (skipUntilKeyframe && !keyframe) {
             droppedCongested++;
             report();
@@ -399,6 +726,28 @@ public final class IkarosSeiPublisher {
         // this line read "30 in / 30 out, streaming=true" while the server
         // was receiving nothing whatsoever. A publish can fail in a way that
         // looks, from here, exactly like a publish that works.
+        // On the RTMP path these SRT counters do not apply and read -1, which
+        // is worse than useless in a log line - so say which transport is
+        // actually running and report its numbers.
+        IkarosRtmpPublisher r = rtmp;
+        if (r != null) {
+            govern(r);
+            Log.i(TAG, framesIn + " in / " + framesOut + " published per s"
+                    + "  droppedToRate=" + droppedToRate
+                    + "  droppedEncoderFull=" + droppedEncoderFull
+                    + "  droppedLinkFull=" + droppedLinkFull
+                    + "  droppedNoPose=" + droppedNoPose
+                    + "  droppedNoConfig=" + droppedNoConfig
+                    + "  bitrate=" + (bitrateNowBps / 1000) + "k/" + (bitrateCeilingBps / 1000) + "k"
+                    + "  queue=" + Math.round(r.queuePressure() * 100) + "%"
+                    + "  connected=" + r.isRunning());
+            windowStartMs = now;
+            framesIn = 0; framesOut = 0;
+            droppedToRate = 0; droppedEncoderFull = 0; droppedLinkFull = 0;
+            droppedNoPose = 0; droppedNoConfig = 0; backwardsPts = 0; droppedCongested = 0;
+            return;
+        }
+
         SrtClient c = srtClient;
         long sent = c == null ? -1 : c.getSentVideoFrames();
         long dropped = c == null ? -1 : c.getDroppedVideoFrames();

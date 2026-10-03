@@ -178,6 +178,7 @@ abstract class DJIMainActivity : AppCompatActivity() {
         // the field above) and who owns reconnection - none of which should
         // arrive with an app update.
         binding.cbSeiPublish.isChecked = prefs.getBoolean("seiPublish", false)
+        binding.cbAdaptiveBitrate.isChecked = prefs.getBoolean("adaptiveBitrate", false)
         binding.etSrtHost.setText(prefs.getString("srtHost", ""))
         binding.etSrtPort.setText(prefs.getInt("srtPort", 8890).toString())
 
@@ -237,6 +238,7 @@ abstract class DJIMainActivity : AppCompatActivity() {
                 .putFloat("aglOffsetM",
                     binding.etAglOffset.text.toString().trim().toFloatOrNull() ?: 0f)
                 .putBoolean("seiPublish", binding.cbSeiPublish.isChecked)
+                .putBoolean("adaptiveBitrate", binding.cbAdaptiveBitrate.isChecked)
                 // Blank means "the RTMP host": mediamtx answers RTMP and SRT
                 // on the same machine, and a second hostname to keep in step
                 // is a second thing to get wrong.

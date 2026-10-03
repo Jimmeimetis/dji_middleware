@@ -268,6 +268,16 @@ public class DefaultLayoutActivity extends AppCompatActivity {
     // and who handles a dropped connection, which is not something to inherit
     // by upgrading.
     private boolean seiPublish = false;
+
+    /**
+     * Whether the publisher may lower the bitrate when the link struggles.
+     *
+     * Off by default, and that is the point: a fixed bitrate is predictable,
+     * and a stream that quietly changes quality mid-flight is one more thing
+     * to reason about when something looks wrong. The operator turns it on
+     * when they know the link is poor.
+     */
+    private boolean adaptiveBitrate = false;
     private IkarosSeiPublisher seiPublisher;
     // SRT ingest. Same network load balancer as RTMP - mediamtx listens on
     // both - so this defaults to the RTMP host rather than a second name to
@@ -318,16 +328,30 @@ public class DefaultLayoutActivity extends AppCompatActivity {
 
     private ICameraStreamManager streamManager;
     private UdpSender udpSender;
-    // Telemetry at 5 Hz. The gimbal and the zoom are what Ikaros geolocates
-    // through, and they move while the aircraft is still - at 0.5 Hz a pan
-    // across a scene was described by two samples, and every detection between
-    // them was placed through a camera pointing somewhere else. The server
-    // interpolates poses by timestamp, so what it can resolve is bounded by
-    // this interval.
+    // Telemetry at 1 Hz, down from 5.
+    //
+    // 5 Hz was right when THIS was what Ikaros geolocated through: the gimbal
+    // moves while the aircraft is still, the server interpolates poses by
+    // timestamp, and at 0.5 Hz a pan across a scene was two samples with every
+    // detection between them placed through a camera pointing somewhere else.
+    //
+    // That reasoning no longer applies. The pose now travels inside the video,
+    // in each frame's SEI, so geolocation reads the pose the camera actually
+    // had rather than interpolating this timeline - the interval stopped
+    // bounding what the server can resolve. What is left consumes it at 1 Hz
+    // or slower: the map's vehicle marker, the recorded flight path, and the
+    // fallback timeline PARM keeps behind the SEI. At 5 Hz four of every five
+    // samples were written to the database and never looked at live, at 3.2
+    // requests a second measured.
+    //
+    // The cost is the FALLBACK. An aircraft running an app build with no SEI,
+    // or a stretch where the pose is unavailable, is geolocated from this
+    // timeline - and it is now five times coarser. Raise this again if that
+    // path ever matters more than the request volume.
     //
     // Fire-and-forget: OkHttp's enqueue() does not block, so a slow response
     // cannot hold up the next sample.
-    private static final long TELEMETRY_INTERVAL_MS = 200;
+    private static final long TELEMETRY_INTERVAL_MS = 1000;
     // Mission polling stays slow. It is a question about a database row, not a
     // measurement, and at 5 Hz it would be 18,000 pointless requests an hour -
     // enough to matter to the rate limiter if any of them start failing.
@@ -435,6 +459,7 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         rtmpBitrateBps = prefs.getInt("rtmpBitrateBps", rtmpBitrateBps);
         aglOffsetM = prefs.getFloat("aglOffsetM", aglOffsetM);
         seiPublish = prefs.getBoolean("seiPublish", seiPublish);
+        adaptiveBitrate = prefs.getBoolean("adaptiveBitrate", adaptiveBitrate);
         srtHost = prefs.getString("srtHost", srtHost);
         srtPort = prefs.getInt("srtPort", srtPort);
         getProductUUIDAndShowToast();
@@ -722,44 +747,41 @@ public class DefaultLayoutActivity extends AppCompatActivity {
         if (seiPublisher.isStreaming()) {
             return;
         }
-        seiPublisher.start(ComponentIndexType.find(0), buildSrtUrl(), new ConnectChecker() {
+        ComponentIndexType cameraIndex = ComponentIndexType.find(0);
+
+        // Ask the aircraft to encode lower, and expect nothing. This is the
+        // only SDK lever that reaches the encoder upstream of us, and an
+        // RC Pro Enterprise refuses it: requested 2000000, readback -1. Logged
+        // because the answer is hardware-specific - an aircraft that honours
+        // it would make the re-encode below unnecessary.
+        try {
+            streamManager.setStreamEncoderBitrate(cameraIndex, rtmpBitrateBps);
+            Log.i("RTMP", "camera encoder bitrate requested=" + rtmpBitrateBps
+                    + " bps readback=" + streamManager.getStreamEncoderBitrate(cameraIndex));
+        } catch (Exception e) {
+            Log.e("RTMP", "could not set camera encoder bitrate", e);
+        }
+
+        // Our own encode, our own muxing, our own RTMP. See IkarosRtmpClient
+        // for why none of the library transports could do this job.
+        seiPublisher.startEncodingRtmp(cameraIndex, buildRtmpUrl(), rtmpBitrateBps, 30,
+                adaptiveBitrate, new IkarosRtmpPublisher.Listener() {
             @Override
-            public void onConnectionStarted(@NonNull String url) {
-                Log.i("SRT", "connecting to " + IkarosSeiPublisher.redact(url));
+            public void onStarted() {
+                Log.i("RTMP", "publishing");
             }
 
             @Override
-            public void onConnectionSuccess() {
-                Log.i("SRT", "publishing");
-            }
-
-            @Override
-            public void onConnectionFailed(@NonNull String reason) {
-                // Reconnection is ours now. One retry per failure with a
-                // fixed delay, rather than a backoff: a drone's link drops
-                // out and comes back, and a stream that waits a minute to
-                // retry has missed the part of the flight worth seeing.
-                Log.e("SRT", "connection failed: " + reason);
-                if (seiPublisher != null && seiPublisher.isStreaming()) return;
+            public void onFailed(String reason) {
+                Log.e("RTMP", "publish failed: " + reason);
+                if (seiPublisher != null) seiPublisher.stop();
+                // Reconnection is ours now. One retry at a fixed delay rather
+                // than a backoff: a drone's link drops out and comes back, and
+                // a stream that waits a minute to retry has missed the part of
+                // the flight worth seeing.
                 handler.postDelayed(() -> {
                     if (seiPublish && missionStarted) startSeiPublish();
                 }, 3000);
-            }
-
-            @Override
-            public void onDisconnect() {
-                Log.i("SRT", "disconnected");
-            }
-
-            @Override
-            public void onAuthError() {
-                Log.e("SRT", "authentication rejected");
-                runOnUiThread(() -> showToast("Stream auth failed"));
-            }
-
-            @Override
-            public void onAuthSuccess() {
-                Log.i("SRT", "authenticated");
             }
         });
     }
